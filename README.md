@@ -54,61 +54,46 @@
 - Современный браузер с поддержкой закладок со скриптом и передачей данных между вкладками. Консоль разработчика и API-ключ пользователю не нужны.
 - Для подключения пользователей по сети нужен HTTPS и прокси, который обслуживает Open WebUI и направляет `/chatgpt-import/` на сервис миграции с того же адреса. Для локального запуска можно использовать `127.0.0.1`.
 
-## Развёртывание рядом с Open WebUI
+## Развёртывание
 
-### 1. Запустите сервис импорта
+### Локальный запуск на Windows
 
-Скачайте проект из ветки `refactoring`. Сервису нужны лежащие рядом `browser_import.py`, `import_chatgpt.py`, `convert.js` и `chatgpt-import.gif`.
+Установите Node.js, если его ещё нет, и используйте существующую установку Open WebUI с виртуальным окружением в `.venv`. Зависимости npm устанавливать не нужно. Запустите из папки проекта следующую команду PowerShell.
 
-```sh
-git clone --branch refactoring https://github.com/kot1vertolet-cloud/chatgpt-exporter.git
-cd chatgpt-exporter
+```powershell
+.\start-local.ps1 -OpenWebUIRoot 'D:\Apps\Open WebUI'
 ```
 
-Выделите процессу каталог для SQLite-журнала сверки и включите сервис в штатный менеджер процессов. В примере ниже Open WebUI доступен с хоста сервиса по `127.0.0.1:8080`.
+Скрипт запускает Open WebUI, импортёр и локальный прокси. Open WebUI остаётся доступен на `http://127.0.0.1:3000/`, импорт — на `http://127.0.0.1:3000/chatgpt-import/`. Скрипт переносит существующий экземпляр Open WebUI на внутренний порт и использует его каталог данных. Для нестандартного расположения можно указать `-WebUIDataDir`, а для существующего журнала импорта — `-StateDir`.
+
+После перехода на единый адрес замените ранее сохранённую закладку ссылкой с новой страницы импорта.
+
+### Linux с существующим Open WebUI и Nginx
+
+В пакете есть готовый сервис systemd и маршрут Nginx. Разместите checkout ветки `refactoring` в `/opt/chatgpt-exporter` и установите файлы запуска.
 
 ```sh
-python browser_import.py \
-  --upstream http://127.0.0.1:8080 \
-  --public-origin https://webui.example.org \
-  --data-dir /var/lib/chatgpt-import \
-  --upload-limit-mib 256 \
-  --archive-limit-mib 256
+sudo install -m 644 deploy/chatgpt-import.service /etc/systemd/system/chatgpt-import.service
+sudo install -m 644 deploy/chatgpt-import.env.example /etc/chatgpt-import.env
+sudo install -m 644 deploy/chatgpt-import.nginx.conf /etc/nginx/chatgpt-import.conf
 ```
 
-- `--upstream` — адрес API установленного Open WebUI, доступный процессу импорта.
-- `--public-origin` — точный адрес Open WebUI, который видит браузер, без завершающей косой черты.
-- `--data-dir` — закрытый каталог с журналом сверки перенесённых записей. Аккаунт процесса должен иметь право записи в этот каталог.
-- `--upload-limit-mib` — лимит одного вложения. `--archive-limit-mib` — лимит одной входящей части. Согласуйте его с ограничением прокси и доступной оперативной памятью.
+В `/etc/chatgpt-import.env` задайте `OPEN_WEBUI_UPSTREAM` — адрес существующего Open WebUI, и `OPEN_WEBUI_ORIGIN` — его публичный HTTPS-адрес. При необходимости настройте лимиты одного вложения и одной части выгрузки. Если меняете лимит части, согласуйте его с `client_max_body_size` во фрагменте Nginx.
 
-### 2. Подключите маршрут в прокси Open WebUI
-
-Добавьте в существующий HTTPS-блок Nginx. Сервис слушает `127.0.0.1:3012` по умолчанию. Прокси должен иметь доступ к этому адресу. Остальные маршруты обслуживает ваш действующий Open WebUI.
+Добавьте в существующий HTTPS-блок `server` для Open WebUI одну директиву.
 
 ```nginx
-location = /chatgpt-import {
-    return 308 /chatgpt-import/;
-}
-
-location /chatgpt-import/ {
-    proxy_pass http://127.0.0.1:3012;
-    proxy_http_version 1.1;
-    client_max_body_size 256m;
-    proxy_request_buffering off;
-    proxy_read_timeout 1800s;
-}
+include /etc/nginx/chatgpt-import.conf;
 ```
 
-Для страницы импорта сохраните поведение `Cross-Origin-Opener-Policy: unsafe-none`. Если прокси глобально задаёт строгую политику, исключите этот маршрут. Это позволяет вкладке ChatGPT передать данные во вкладку импорта. Пользователь открывает `https://webui.example.org/chatgpt-import/` после входа в Open WebUI на этом же адресе.
-
-### Локальный запуск
-
-Если Open WebUI слушает `127.0.0.1:3000`, запустите сервис из папки проекта следующей командой.
+Для `/chatgpt-import/` требуется стандартное поведение `Cross-Origin-Opener-Policy: unsafe-none`. Если прокси задаёт строгую политику глобально, исключите этот путь. После подключения маршрута запустите сервис и перечитайте конфигурацию Nginx.
 
 ```sh
-python browser_import.py --upstream http://127.0.0.1:3000 --public-origin http://127.0.0.1:3012 --local-webui http://127.0.0.1:3000 --data-dir ./import-state --upload-limit-mib 256 --archive-limit-mib 1024
+sudo systemctl daemon-reload
+sudo systemctl enable --now chatgpt-import
+sudo systemctl reload nginx
 ```
 
-Войдите в Open WebUI по адресу `http://127.0.0.1:3000` и откройте `http://127.0.0.1:3012/chatgpt-import/`. В обеих вкладках используйте `127.0.0.1`, чтобы браузер передал сессию на страницу импорта.
+Пользователь открывает `https://webui.example.org/chatgpt-import/` на том же адресе, где входит в Open WebUI.
 
 [Пошаговая инструкция с демонстрацией](IMPORT.md)

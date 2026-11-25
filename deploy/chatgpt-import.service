@@ -1,0 +1,16 @@
+[Unit]
+Description=ChatGPT migration for Open WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/chatgpt-import.env
+WorkingDirectory=/opt/chatgpt-exporter
+DynamicUser=yes
+StateDirectory=chatgpt-import
+ExecStart=/usr/bin/python3 -B /opt/chatgpt-exporter/browser_import.py --upstream ${OPEN_WEBUI_UPSTREAM} --public-origin ${OPEN_WEBUI_ORIGIN} --data-dir /var/lib/chatgpt-import --upload-limit-mib ${UPLOAD_LIMIT_MIB} --archive-limit-mib ${ARCHIVE_LIMIT_MIB}
+Restart=on-failure
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
