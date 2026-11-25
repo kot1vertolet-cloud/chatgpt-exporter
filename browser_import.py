@@ -25,6 +25,7 @@ from import_chatgpt import (
 
 ROOT = '/chatgpt-import/'
 POST = ROOT + 'upload'
+CHECK = POST + '/check'
 EXPORT_SCRIPT = Path(__file__).with_name('convert.js')
 GUIDE_GIF = Path(__file__).with_name('chatgpt-import.gif')
 EXPORT_TARGET = '/* OPEN_WEBUI_IMPORT_PAGE */ null'
@@ -121,8 +122,18 @@ form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!transferredArchive) return;
   button.disabled = true;
-  status.textContent = 'Импортирую чаты. Оставьте страницу открытой.';
+  status.textContent = 'Проверяю размер архива и сессию Open WebUI…';
   try {
+    const check = await fetch('/chatgpt-import/upload/check', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'X-Archive-Size': String(transferredArchive.size)},
+    });
+    if (!check.ok) {
+      const data = await check.json().catch(() => null);
+      status.textContent = data?.error || 'Сервис не разрешил загрузку архива.';
+      return;
+    }
+    status.textContent = 'Отправляю архив и импортирую чаты. Оставьте страницу открытой.';
     const response = await fetch('/chatgpt-import/upload', {
       method: 'POST', credentials: 'same-origin', body: transferredArchive,
       headers: {'Content-Type': 'application/zip'},
@@ -147,7 +158,8 @@ form.addEventListener('submit', async (event) => {
     transferredArchive = null;
     form.hidden = true;
   } catch {
-    status.textContent = 'Связь прервалась. Можно повторить отправку того же ZIP.';
+    const size = Math.ceil(transferredArchive.size / (1024 * 1024));
+    status.textContent = `Связь с сервисом прервалась. Размер ZIP ${size} МиБ. Можно повторить отправку.`;
   } finally {
     button.disabled = false;
   }
@@ -244,19 +256,16 @@ class BrowserImport(BaseHTTPRequestHandler):
             raise UploadError(401, 'Open WebUI не подтвердил вашу учётную запись.') from None
         return api, {'id': user_id, 'role': user.get('role')}
 
-    def request_file(self):
-        if self.headers.get('Origin') != self.server.options.public_origin:
-            raise UploadError(403, 'Загрузите архив со страницы импорта Open WebUI.')
-        if self.headers.get_content_type() != 'application/zip':
-            raise UploadError(400, 'Ожидался ZIP из вкладки ChatGPT.')
-        sizes = self.headers.get_all('Content-Length', [])
-        if len(sizes) != 1 or self.headers.get('Transfer-Encoding') or not sizes[0].isascii() or not sizes[0].isdigit():
-            raise UploadError(411, 'Прокси должен передавать размер загрузки.')
-        if len(sizes[0]) > 12:
-            raise UploadError(413, 'Архив превышает лимит загрузки.')
+    def archive_size(self, header):
+        sizes = self.headers.get_all(header, [])
+        if len(sizes) != 1 or not sizes[0].isascii() or not sizes[0].isdigit() or len(sizes[0]) > 12:
+            raise UploadError(411, 'Сервису не передан размер ZIP.')
         size = int(sizes[0])
-        if size <= 0 or size > self.server.options.upload_limit_mib * MIB:
-            raise UploadError(413, 'Архив пуст или превышает лимит загрузки.')
+        limit = self.server.options.archive_limit_mib
+        if not size:
+            raise UploadError(400, 'Получен пустой ZIP.')
+        if size > limit * MIB:
+            raise UploadError(413, f'Размер ZIP {((size + MIB - 1) // MIB)} МиБ превышает лимит {limit} МиБ.')
         return size
 
     def receive(self, buffer, length):
@@ -292,19 +301,32 @@ class BrowserImport(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.close_connection = True
-        if self.path != POST:
+        if self.path not in {POST, CHECK}:
             self.json(404, {'error': 'Страница не найдена.'})
             return
         try:
-            size = self.request_file()
+            if self.headers.get('Origin') != self.server.options.public_origin:
+                raise UploadError(403, 'Загрузите архив со страницы импорта Open WebUI.')
+            if self.headers.get('Transfer-Encoding'):
+                raise UploadError(411, 'Прокси должен передавать размер загрузки.')
+            checking = self.path == CHECK
+            if checking:
+                if self.headers.get_all('Content-Length', []) not in ([], ['0']):
+                    raise UploadError(400, 'Запрос проверки должен быть без тела.')
+                self.archive_size('X-Archive-Size')
+            else:
+                if self.headers.get_content_type() != 'application/zip':
+                    raise UploadError(400, 'Ожидался ZIP из вкладки ChatGPT.')
+                size = self.archive_size('Content-Length')
             api, user = self.authenticated_user()
             if not self.server.slots.acquire(blocking=False):
                 raise UploadError(503, 'Сейчас выполняется другой импорт. Повторите загрузку позже.')
             try:
-                result = self.import_upload(api, user, size)
+                result = {} if checking else self.import_upload(api, user, size)
             finally:
                 self.server.slots.release()
         except UploadError as error:
+            print(f'Import request rejected: HTTP {error.status}', file=sys.stderr, flush=True)
             self.json(error.status, {'error': error.message})
         except RequestFailure as error:
             if error.status in {401, 403}:
@@ -320,6 +342,8 @@ class BrowserImport(BaseHTTPRequestHandler):
             self.json(409, {'error': f'Импорт остановлен. {error}'})
         except (zipfile.BadZipFile, ValueError, TypeError, KeyError, AttributeError, RuntimeError, EOFError):
             self.json(400, {'error': 'Не удалось прочитать ZIP или ответ Open WebUI.'})
+        except MemoryError:
+            self.json(503, {'error': 'Сервису не хватило оперативной памяти для импорта ZIP.'})
         except (OSError, sqlite3.Error):
             self.json(503, {'error': 'Сервер не завершил импорт. Можно повторить отправку того же ZIP.'})
         else:
@@ -341,9 +365,11 @@ def main():
     parser.add_argument('--port', default=3012, type=positive_int, help='Loopback listener port')
     parser.add_argument('--data-dir', required=True, type=Path, help='Private directory for the import receipts')
     parser.add_argument('--upload-limit-mib', required=True, type=positive_int)
+    parser.add_argument('--archive-limit-mib', type=positive_int, help='Maximum incoming ZIP size in MiB')
     parser.add_argument('--max-expanded-mib', default=2048, type=positive_int)
     parser.add_argument('--timeout', default=120, type=positive_int, help='Open WebUI timeout in seconds')
     args = parser.parse_args()
+    args.archive_limit_mib = args.archive_limit_mib or args.upload_limit_mib
     origin = urlsplit(args.public_origin)
     if (origin.scheme not in {'http', 'https'} or not origin.hostname or origin.username or origin.password
             or origin.path or origin.query or origin.fragment
