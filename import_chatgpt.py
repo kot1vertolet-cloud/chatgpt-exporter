@@ -1,43 +1,24 @@
-#!/usr/bin/env python3
-"""Pack and import a ChatGPT export through the Open WebUI API. Python 3.10+."""
+"""Read ChatGPT ZIP data and import it through the Open WebUI API. Python 3.10+."""
 
-import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from copy import deepcopy
-import getpass
 import hashlib
 from http.client import HTTPException as TransportError
-from io import BytesIO
 import json
 import math
 import mimetypes
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 import re
 import sqlite3
 import stat
-import sys
 import unicodedata
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
-import zipfile
-
-import pyzipper
-from Cryptodome.Cipher import AES
-
 
 MIB = 1024 * 1024
-PASSPHRASE_LIMIT = 1024
-ENCRYPTED_PAYLOAD = 'export.zip'
-BROWSER_ENCRYPTED_PAYLOAD = 'export.gcm'
-BROWSER_MAGIC = b'CGZIPGCM1'
-BROWSER_SALT_LENGTH = 16
-BROWSER_NONCE_LENGTH = 12
-BROWSER_TAG_LENGTH = 16
-BROWSER_KDF_ROUNDS = 600_000
 MARKER = 'chatgpt_import'
 API = '/api/v1'
 PERSONALIZATION = {
@@ -73,14 +54,6 @@ class UnconfirmedWrite(ImportFailure):
     pass
 
 
-class ArchiveEncryptionError(ImportFailure):
-    pass
-
-
-class WrongPassphrase(ArchiveEncryptionError):
-    pass
-
-
 class RequestFailure(ImportFailure):
     def __init__(self, method, route, status=None, detail=None):
         self.status = status
@@ -109,87 +82,6 @@ def hash_stream(handle, initial=b''):
     return checksum.hexdigest()
 
 
-def validate_passphrase(value):
-    if not value.strip() or len(value) > PASSPHRASE_LIMIT:
-        raise ArchiveEncryptionError('Enter a non-empty passphrase of at most 1024 UTF-8 bytes')
-
-
-def prompt_passphrase(confirm=False):
-    if not sys.stdin.isatty():
-        raise ArchiveEncryptionError('An interactive terminal is required for hidden passphrase input')
-    first = getpass.getpass('Ключ-фраза ZIP: ').encode('utf-8')
-    validate_passphrase(first)
-    if confirm and getpass.getpass('Повтори ключ-фразу: ').encode('utf-8') != first:
-        raise ArchiveEncryptionError('Passphrases do not match')
-    return first
-
-
-@contextmanager
-def decrypt_zip(source, size, passphrase, limit):
-    validate_passphrase(passphrase)
-    if size > limit:
-        raise ArchiveEncryptionError('ZIP exceeds the input size limit')
-    with BytesIO() as plain:
-        try:
-            with pyzipper.AESZipFile(source, 'r') as archive:
-                entries = archive.infolist()
-                if len(entries) != 1:
-                    raise ArchiveEncryptionError('Expected a ZIP encrypted by this converter')
-                entry = entries[0]
-                if not 0 < entry.file_size <= limit:
-                    raise ArchiveEncryptionError('Invalid size of the encrypted ZIP payload')
-                if entry.orig_filename == BROWSER_ENCRYPTED_PAYLOAD:
-                    if entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 1:
-                        raise ArchiveEncryptionError('Invalid encrypted browser ZIP')
-                    with archive.open(entry) as content:
-                        decrypt_browser_payload(content, entry.file_size, passphrase, plain)
-                else:
-                    if (entry.orig_filename != ENCRYPTED_PAYLOAD or entry.wz_aes_strength != 3
-                            or entry.wz_aes_vendor_id != b'AE' or entry.wz_aes_version != 2
-                            or entry.compress_type != zipfile.ZIP_STORED or not entry.flag_bits & 1):
-                        raise ArchiveEncryptionError('Expected a ZIP encrypted by this converter')
-                    with archive.open(entry, pwd=passphrase) as content:
-                        for block in chunks(content):
-                            if plain.tell() + len(block) > entry.file_size:
-                                raise ArchiveEncryptionError('Invalid size of the encrypted ZIP payload')
-                            plain.write(block)
-                    if plain.tell() != entry.file_size:
-                        raise ArchiveEncryptionError('The encrypted ZIP is incomplete')
-        except RuntimeError:
-            raise WrongPassphrase('Incorrect passphrase') from None
-        except (pyzipper.BadZipFile, EOFError):
-            raise ArchiveEncryptionError('The encrypted ZIP is damaged or the passphrase is incorrect') from None
-        length = plain.tell()
-        plain.seek(0)
-        yield plain, length
-
-
-def decrypt_browser_payload(content, size, passphrase, plain):
-    salt_end = len(BROWSER_MAGIC) + BROWSER_SALT_LENGTH
-    header_length = salt_end + BROWSER_NONCE_LENGTH
-    remaining = size - header_length - BROWSER_TAG_LENGTH
-    header = content.read(header_length)
-    if remaining <= 0 or len(header) != header_length or not header.startswith(BROWSER_MAGIC):
-        raise ArchiveEncryptionError('Invalid encrypted browser ZIP header')
-    salt = header[len(BROWSER_MAGIC):salt_end]
-    key = hashlib.pbkdf2_hmac('sha256', passphrase, salt, BROWSER_KDF_ROUNDS, dklen=32)
-    cipher = AES.new(key, AES.MODE_GCM, nonce=header[salt_end:], mac_len=BROWSER_TAG_LENGTH)
-    cipher.update(header)
-    while remaining:
-        block = content.read(min(MIB, remaining))
-        if not block:
-            raise ArchiveEncryptionError('The encrypted ZIP is incomplete')
-        plain.write(cipher.decrypt(block))
-        remaining -= len(block)
-    tag = content.read(BROWSER_TAG_LENGTH)
-    if len(tag) != BROWSER_TAG_LENGTH:
-        raise ArchiveEncryptionError('The encrypted ZIP is incomplete')
-    try:
-        cipher.verify(tag)
-    except ValueError:
-        raise WrongPassphrase('Incorrect passphrase or damaged archive') from None
-
-
 def path_key(name):
     return unicodedata.normalize('NFC', name).casefold()
 
@@ -207,67 +99,42 @@ def checked_path(name):
 
 
 class Export:
-    def __init__(self, source, max_zip, max_expanded):
-        self.source = source
-        self.max_zip = max_zip
-        self.max_expanded = max_expanded
-        self.archive = None
+    def __init__(self, archive, max_expanded):
+        self.archive = archive
         self.entries = {}
         self.personalization = {}
         self.personalization_unavailable = []
+        self._register_entries(max_expanded)
 
-    @contextmanager
-    def open(self):
-        if self.source.is_dir():
-            entries = ((p.relative_to(self.source).as_posix(), p, p.is_dir(), p.stat().st_size)
-                       for p in self.source.rglob('*'))
-            self.register(entries)
-            yield self
-            return
-        with self.source.open('rb') as original:
-            with self.open_zip(original, os.fstat(original.fileno()).st_size):
-                yield self
-
-    @contextmanager
-    def open_zip(self, original, size):
-        if size > self.max_zip:
-            raise ImportFailure('ZIP exceeds the input size limit')
-        with zipfile.ZipFile(original) as archive:
-            self.archive = archive
-            self.register((i.orig_filename, i, i.is_dir(), i.file_size) for i in archive.infolist())
-            yield self
-
-    def register(self, entries):
+    def _register_entries(self, max_expanded):
         seen = {}
         size = 0
-        for name, entry, is_dir, length in entries:
-            path = checked_path(name)
+        for entry in self.archive.infolist():
+            path = checked_path(entry.orig_filename)
+            is_dir = entry.is_dir()
             key = path_key(path.as_posix())
             if key in seen or len(seen) >= 30_000:
                 raise ImportFailure('Duplicate paths or too many entries in export')
-            if isinstance(entry, Path) and entry.is_symlink():
-                raise ImportFailure('Symbolic link in export')
-            if isinstance(entry, zipfile.ZipInfo):
-                kind = stat.S_IFMT(entry.external_attr >> 16)
-                if kind not in {0, stat.S_IFDIR if is_dir else stat.S_IFREG} or entry.flag_bits & 1:
-                    raise ImportFailure('Encrypted entry or unsupported file type in ZIP')
+            kind = stat.S_IFMT(entry.external_attr >> 16)
+            if kind not in {0, stat.S_IFDIR if is_dir else stat.S_IFREG} or entry.flag_bits & 1:
+                raise ImportFailure('Encrypted entry or unsupported file type in ZIP')
             seen[key] = is_dir
             if not is_dir:
-                size += length
-                if size > self.max_expanded:
+                size += entry.file_size
+                if size > max_expanded:
                     raise ImportFailure('Expanded export exceeds the size limit')
-                self.entries[path] = (entry, length)
+                self.entries[path] = entry
         for key in seen:
             if any(seen.get(parent.as_posix()) is False for parent in PurePosixPath(key).parents):
                 raise ImportFailure('File and directory paths collide in export')
 
     def read(self, path):
-        entry, _ = self.entries[path]
-        return self.archive.open(entry) if self.archive else entry.open('rb')
+        return self.archive.open(self.entries[path])
 
     def inventory(self):
         conversations, projects, assets = {}, [], {}
-        for path, (_, length) in sorted(self.entries.items()):
+        for path, entry in sorted(self.entries.items()):
+            length = entry.file_size
             name = path.name.casefold()
             directories = {part.casefold() for part in path.parts[:-1]}
             source_kind = SOURCE_JSON.fullmatch(name)
@@ -324,49 +191,7 @@ class Export:
         return conversations, projects, assets
 
 
-def pack_export(source, output, passphrase):
-    validate_passphrase(passphrase)
-    if output.suffix.casefold() != '.zip':
-        raise ArchiveEncryptionError('The encrypted output must have a .zip extension')
-    with source.open() as export:
-        created = False
-        try:
-            handle = output.open('xb')
-            created = True
-            with handle:
-                with pyzipper.AESZipFile(handle, 'w', compression=zipfile.ZIP_STORED) as archive:
-                    archive.setpassword(passphrase)
-                    archive.setencryption(pyzipper.WZ_AES, nbits=256, force_wz_aes_version=2)
-                    with archive.open(ENCRYPTED_PAYLOAD, 'w', force_zip64=True) as payload:
-                        if export.source.is_dir():
-                            with zipfile.ZipFile(payload, 'w', compression=zipfile.ZIP_DEFLATED) as inner:
-                                for path, (entry, _) in sorted(export.entries.items()):
-                                    inner.write(entry, path.as_posix())
-                        else:
-                            with export.source.open('rb') as original:
-                                for block in chunks(original):
-                                    payload.write(block)
-                if handle.tell() > export.max_zip:
-                    raise ArchiveEncryptionError('The encrypted ZIP exceeds the output size limit')
-        except BaseException:
-            if created:
-                output.unlink(missing_ok=True)
-            raise
-
-
-@contextmanager
-def open_import(source):
-    if source.source.is_dir():
-        with source.open() as export:
-            yield export
-        return
-    passphrase = prompt_passphrase()
-    with source.source.open('rb') as sealed:
-        size = os.fstat(sealed.fileno()).st_size
-        with decrypt_zip(sealed, size, passphrase, source.max_zip) as (plain, length):
-            with source.open_zip(plain, length) as export:
-                yield export
-
+# Match chat metadata to entries in the ZIP.
 
 def source_name(value):
     if not isinstance(value, str) or not value:
@@ -769,6 +594,8 @@ def convert(conversations, projects, assets, warnings):
     return output, names
 
 
+# Open WebUI transport and import receipts.
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -929,12 +756,11 @@ def find_marker(record, group):
 
 
 class Migration:
-    def __init__(self, api, user, connection, retry_unconfirmed, attachment_sizes):
+    def __init__(self, api, user, connection, attachment_sizes):
         self.api = api
         self.user = user
         self.db = connection
         self.scope = f'{api.url}\n{user}'
-        self.retry_unconfirmed = retry_unconfirmed
         self.attachment_sizes = attachment_sizes
         self.checked_files = {}
         self.existing = {}
@@ -1023,8 +849,8 @@ class Migration:
                     self.existing[key] = record
                 self.counts[f'{key[0]}_unchanged' if previous_hash == marker['sha256'] else f'{key[0]}_changed'] += 1
                 return ident
-        elif prior and not self.retry_unconfirmed:
-            raise UnconfirmedWrite(f'Previous {key[0]} request is unresolved. See --retry-unconfirmed in --help')
+        elif prior:
+            raise UnconfirmedWrite(f'Previous {key[0]} request is unresolved')
         if prepare:
             prepare()
         self.receipt(marker, None)
@@ -1123,12 +949,7 @@ def chat_payload(chat, user, refs, marker, folder_id=None):
     }
 
 
-def server_preflight(api, args, upload_sizes, need_folders, user=None):
-    from_session = user is not None
-    if user is None:
-        user = api.get(API + '/users/user/status')
-    if user.get('id') != args.user_id:
-        raise ImportFailure('The API key belongs to a different Open WebUI user')
+def server_preflight(api, user, upload_limit, upload_sizes, need_folders):
     permissions = api.get(API + '/users/permissions')
     if user.get('role') != 'admin':
         chat = permissions.get('chat') or {}
@@ -1136,38 +957,19 @@ def server_preflight(api, args, upload_sizes, need_folders, user=None):
             raise ImportFailure('Chat import is not permitted for this user')
         if need_folders and not (permissions.get('features') or {}).get('folders'):
             raise ImportFailure('Folders are not permitted for this user')
-    limit = args.upload_limit_mib * MIB
-    if from_session:
-        configured = (api.get('/api/config').get('file') or {}).get('max_size')
-        if configured:
-            limit = min(limit, int(configured) * MIB)
-    elif user.get('role') == 'admin':
-        try:
-            configured = api.get(API + '/retrieval/config').get('FILE_MAX_SIZE')
-        except RequestFailure as error:
-            if error.status != 403:
-                raise
-            configured = None
-        if configured:
-            limit = min(limit, int(configured) * MIB)
+    configured = (api.get('/api/config').get('file') or {}).get('max_size')
+    limit = min(upload_limit, int(configured) * MIB) if configured else upload_limit
     if any(size > limit for size in upload_sizes):
         raise ImportFailure(f'An upload exceeds the effective {limit // MIB} MiB limit')
 
 
-def apply_import(args, export, chats, projects, assets, api=None, user=None):
-    if api is None:
-        key = os.environ.get('OPEN_WEBUI_API_KEY')
-        if not key and sys.stdin.isatty():
-            key = getpass.getpass('Open WebUI API key: ')
-        if not key or not key.strip():
-            raise ImportFailure('An Open WebUI API key is required')
-        api = WebUI(args.url, key.strip(), args.timeout)
+def apply_import(api, user, export, chats, projects, assets, *, upload_limit, journal_path):
     associated = {path for chat in chats for path in chat['assets']}
-    server_preflight(api, args, [assets[p]['size'] for p in associated], bool(projects), user)
+    server_preflight(api, user, upload_limit, (assets[path]['size'] for path in associated), bool(projects))
     attachment_sizes = {assets[path]['sha256']: assets[path]['size'] for path in associated}
 
-    with journal(args.journal) as database:
-        migration = Migration(api, args.user_id, database, args.retry_unconfirmed, attachment_sizes)
+    with journal(journal_path) as database:
+        migration = Migration(api, user['id'], database, attachment_sizes)
         memories = []
         if export.personalization:
             try:
@@ -1211,7 +1013,7 @@ def apply_import(args, export, chats, projects, assets, api=None, user=None):
                         references[path] = file_reference(ident, path.name, mime, info['size'])
 
             def write_chat():
-                payload = chat_payload(chat, args.user_id, references, marker, folder_ids.get(chat['project']))
+                payload = chat_payload(chat, user['id'], references, marker, folder_ids.get(chat['project']))
                 return migration.import_chat(payload)
 
             migration.ensure('chat', marker, write_chat, prepare_files)
@@ -1226,83 +1028,4 @@ def apply_import(args, export, chats, projects, assets, api=None, user=None):
             if not isinstance(item, dict) or (item.get('path'), item.get('type'), item.get('content')) != (path, kind, content):
                 raise ImportFailure('Open WebUI не подтвердил добавление записи памяти.')
             migration.counts['memory_written'] += 1
-        return {'import': dict(migration.counts)}
-
-
-def summarize(conversations, chats, projects, assets, warnings):
-    matched = {path for chat in chats for path in chat['assets']}
-    return {
-        'conversations_found': len(conversations), 'conversations_ready': len(chats),
-        'messages_ready': sum(len(chat['messages']) for chat in chats), 'projects': len(projects),
-        'files_found': len(assets), 'files_linked': len(matched),
-        'files_unlinked': len(assets) - len(matched), 'warnings': dict(warnings),
-    }
-
-
-def positive_int(value):
-    number = int(value)
-    if number < 1:
-        raise argparse.ArgumentTypeError('must be a positive integer')
-    return number
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('source', type=Path, help='Export directory or ZIP archive')
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--dry-run', action='store_true', help='Inspect the export locally without calling Open WebUI')
-    mode.add_argument('--apply', action='store_true', help='Import an encrypted ZIP into an Open WebUI account')
-    mode.add_argument('--pack', action='store_true', help='Create an AES-256 ZIP from an export directory or plain ZIP')
-    parser.add_argument('--output', type=Path, help='New encrypted ZIP path, required for --pack')
-    parser.add_argument('--url', default='http://127.0.0.1:3000', help='Open WebUI base URL')
-    parser.add_argument('--user-id', help='Expected Open WebUI account UUID, required for --apply')
-    parser.add_argument('--upload-limit-mib', type=positive_int,
-                        help='Approved per-file limit in MiB, accounting for Open WebUI and reverse proxy limits. Required for --apply')
-    parser.add_argument('--max-zip-mib', type=positive_int, default=256, help='Maximum ZIP size in MiB (default: 256)')
-    parser.add_argument('--max-expanded-mib', type=positive_int, default=2048,
-                        help='Maximum expanded size in MiB (default: 2048)')
-    parser.add_argument('--timeout', type=positive_int, default=120, help='HTTP timeout in seconds (default: 120)')
-    parser.add_argument('--journal', type=Path, default=Path('.chatgpt-import.sqlite3'),
-                        help='Persistent server-side receipt database. Reuse this path across runs')
-    parser.add_argument('--retry-unconfirmed', action='store_true',
-                        help='Retry a missing record only after an administrator confirms the original POST has finished and did not commit')
-    args = parser.parse_args()
-    if args.pack != (args.output is not None):
-        parser.error('--pack and --output must be used together')
-    if args.apply and (args.source.is_dir() or not args.user_id or not args.upload_limit_mib):
-        parser.error('--apply requires a ZIP, --user-id and --upload-limit-mib')
-    if args.apply:
-        try:
-            args.user_id = str(uuid.UUID(args.user_id))
-        except ValueError:
-            parser.error('--user-id must be a UUID')
-
-    warnings = Counter()
-    try:
-        source = Export(args.source, args.max_zip_mib * MIB, args.max_expanded_mib * MIB)
-        if args.pack:
-            pack_export(source, args.output, prompt_passphrase(confirm=True))
-            print(f'Создан зашифрованный ZIP: {args.output}')
-            return 0
-        with open_import(source) as export:
-            conversations, project_rows, assets = export.inventory()
-            chats, projects = convert(conversations, project_rows, assets, warnings)
-            print(json.dumps(summarize(conversations, chats, projects, assets, warnings),
-                             ensure_ascii=False, sort_keys=True), flush=True)
-            if args.apply:
-                result = apply_import(args, export, chats, projects, assets)
-                print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    except KeyboardInterrupt:
-        return 130
-    except ImportFailure as error:
-        print(f'Import stopped: {error}', file=sys.stderr)
-        return 1
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, EOFError,
-            NotImplementedError, zipfile.BadZipFile, sqlite3.Error) as error:
-        print(f'Import stopped: invalid export, server response, or local I/O ({type(error).__name__})', file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())
+        return {'import': dict(migration.counts), 'files_unlinked': len(assets) - len(associated)}
