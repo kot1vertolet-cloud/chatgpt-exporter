@@ -267,6 +267,13 @@ class AssetIndex:
             name = source_name(path.name)
             self.aliases[name].add(path)
             self.aliases[source_name(path.stem)].add(path)
+            if len(path.parts) == 4 and path.parts[0] == 'files' and path.parent.name.startswith('id-'):
+                try:
+                    file_id = bytes.fromhex(path.parent.name[3:]).decode('utf-8')
+                except ValueError:
+                    pass
+                else:
+                    self.aliases[source_name(file_id)].add(path)
             match = re.fullmatch(r'(file[-_][a-z0-9]+)(?:[-_](.+))?', path.stem, re.I)
             if match:
                 self.aliases[path_key(match[1])].add(path)

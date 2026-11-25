@@ -193,20 +193,26 @@
     return { filename, data: new Uint8Array(await response.arrayBuffer()) };
   }
 
-  function deduplicateFilename(name, usedNames) {
-    if (!usedNames.has(name)) { usedNames.add(name); return name; }
-    const dot = name.lastIndexOf(".");
-    const base = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : "";
-    let i = 1;
-    while (usedNames.has(`${base}_${i}${ext}`)) i++;
-    const deduped = `${base}_${i}${ext}`;
-    usedNames.add(deduped);
-    return deduped;
+  function attachmentPath(name, fileId, usedNames) {
+    let safeName = safePathComponent(name) || "attachment";
+    if (isReservedName(safeName)) safeName = `_${safeName}`;
+    const key = Array.from(safeName.normalize("NFC"), (char) => char.toUpperCase().toLowerCase())
+      .join("").replace(/ß/g, "ss");
+    if (safeName === name && !usedNames.has(key)) {
+      usedNames.add(key);
+      return safeName;
+    }
+    // Keep the source ID available when the original filename cannot be used in the ZIP.
+    const encodedId = Array.from(new TextEncoder().encode(fileId), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `id-${encodedId}/${safeName}`;
   }
 
-  function sanitize(name) {
-    return name.replace(/[<>:"/\\|?*]/g, "_").replace(/^[. ]+|[. ]+$/g, "").slice(0, 80) || "untitled";
+  function safePathComponent(value) {
+    return value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").replace(/[. ]+$/g, "");
+  }
+
+  function isReservedName(name) {
+    return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(name.split(".", 1)[0]);
   }
 
   // ── Fetch conversation list ─────────────────────────────────────────
@@ -246,7 +252,9 @@
   for (let i = 0; i < total; i++) {
     const { id: cid, title: rawTitle } = conversations[i];
     const title = rawTitle || "Untitled";
-    const fname = `${sanitize(title)}_${cid.slice(0, 8)}`;
+    const chatName = safePathComponent(title).replace(/^[. ]+/, "").slice(0, 80) || "untitled";
+    const stem = `${chatName}_${cid.slice(0, 8)}`;
+    const fname = isReservedName(stem) ? `_${stem}` : stem;
     const pct = Math.round((i / total) * 100);
     const chat = `Чат ${i + 1} из ${total}`;
 
@@ -264,7 +272,7 @@
         totalFiles++;
         try {
           const { filename, data } = await downloadFile(fileId, fallbackName);
-          const actualName = deduplicateFilename(filename, usedNames);
+          const actualName = attachmentPath(filename, fileId, usedNames);
           entries.push({ path: `files/${fname}/${actualName}`, data });
           await sleep(DELAY);
         } catch {
