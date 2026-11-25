@@ -148,50 +148,25 @@
   // ── File references ─────────────────────────────────────────────────
 
   function extractFileReferences(convo) {
-    const refs = [];
-    const seen = new Set();
-    const mapping = convo.mapping || {};
+    const references = new Map();
+    const add = (id, name) => {
+      if (id && !references.has(id)) references.set(id, name);
+    };
 
-    for (const node of Object.values(mapping)) {
-      const msg = node.message;
-      if (!msg) continue;
-
-      if (msg.content?.parts) {
-        for (const part of msg.content.parts) {
-          if (part?.content_type === "image_asset_pointer" && part.asset_pointer) {
-            const match = part.asset_pointer.match(/^(?:file-service|sediment):\/\/(.+)$/);
-            if (match && !seen.has(match[1])) {
-              seen.add(match[1]);
-              refs.push({
-                fileId: match[1],
-                filename: part.metadata?.dalle?.prompt ? "dalle_image.png" : "image.png",
-              });
-            }
-          }
-        }
+    for (const { message } of Object.values(convo.mapping || {})) {
+      for (const part of message?.content?.parts || []) {
+        if (part?.content_type !== "image_asset_pointer") continue;
+        const match = part.asset_pointer?.match(/^(?:file-service|sediment):\/\/(.+)$/);
+        add(match?.[1], part.metadata?.dalle?.prompt ? "dalle_image.png" : "image.png");
       }
-
-      if (msg.metadata?.attachments) {
-        for (const att of msg.metadata.attachments) {
-          if (att.id && !seen.has(att.id)) {
-            seen.add(att.id);
-            refs.push({ fileId: att.id, filename: att.name || "attachment" });
-          }
-        }
+      for (const attachment of message?.metadata?.attachments || []) {
+        add(attachment.id, attachment.name || "attachment");
       }
-
-      if (msg.metadata?.citations) {
-        for (const cit of msg.metadata.citations) {
-          const fileId = cit.metadata?.file_id || cit.file_id;
-          const title = cit.metadata?.title || cit.title || "citation";
-          if (fileId && !seen.has(fileId)) {
-            seen.add(fileId);
-            refs.push({ fileId, filename: title });
-          }
-        }
+      for (const citation of message?.metadata?.citations || []) {
+        add(citation.metadata?.file_id || citation.file_id, citation.metadata?.title || citation.title || "citation");
       }
     }
-    return refs;
+    return references;
   }
 
   async function downloadFile(fileId, fallbackName) {
@@ -275,14 +250,11 @@
       const convo = await apiGet(`conversation/${cid}`);
       const jsonStr = JSON.stringify(convo);
 
-      // Extract and download file references
-      const fileRefs = extractFileReferences(convo);
       const usedNames = new Set();
-
-      for (const ref of fileRefs) {
+      for (const [fileId, fallbackName] of extractFileReferences(convo)) {
         totalFiles++;
         try {
-          const { filename, data } = await downloadFile(ref.fileId, ref.filename);
+          const { filename, data } = await downloadFile(fileId, fallbackName);
           const actualName = deduplicateFilename(filename, usedNames);
           zipEntries.push({ path: `files/${fname}/${actualName}`, data });
           await sleep(DELAY);

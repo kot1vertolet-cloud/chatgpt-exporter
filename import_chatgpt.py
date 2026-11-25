@@ -75,7 +75,7 @@ def chunks(handle):
         yield block
 
 
-def hash_stream(handle, initial=b''):
+def hash_stream(handle, initial):
     checksum = hashlib.sha256(initial)
     for block in chunks(handle):
         checksum.update(block)
@@ -292,10 +292,10 @@ class AssetIndex:
         return None
 
 
-def unix_time(value, fallback=None):
+def unix_time(value):
     if isinstance(value, (float, int)) and 0 < value < 10**12 and math.isfinite(value):
         return int(value)
-    return fallback
+    return None
 
 
 def outside_code(text, transform):
@@ -900,7 +900,7 @@ def message_id(user, source, node):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, json_bytes(['chatgpt-import', user, source, node]).decode('utf-8')))
 
 
-def chat_payload(chat, user, refs, marker, folder_id=None):
+def chat_payload(chat, user, refs, marker, folder_id):
     ids = {node: message_id(user, chat['id'], node) for node in chat['order']}
     history = {}
     for node in chat['order']:
