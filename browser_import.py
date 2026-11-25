@@ -86,16 +86,30 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
   exportSection.hidden = true;
   const sender = window.opener;
   if (sender) {
-    status.textContent = 'Ожидаю архив из вкладки ChatGPT…';
+    const waitingSince = performance.now();
+    status.textContent = 'Вкладка ChatGPT подготавливает данные для передачи…';
+    const waiting = setInterval(() => {
+      if (sender.closed) {
+        clearInterval(waiting);
+        window.removeEventListener('message', receive);
+        exportSection.hidden = false;
+        status.textContent = 'Вкладка ChatGPT закрыта. Откройте её и запустите выгрузку повторно.';
+        return;
+      }
+      const seconds = Math.floor((performance.now() - waitingSince) / 1000);
+      status.textContent = `Вкладка ChatGPT подготавливает данные для передачи · ${seconds} с.`;
+    }, 1000);
     const receive = (event) => {
       if (event.origin !== chatgptOrigin || event.source !== sender || event.data?.transfer !== transferId) return;
       if (event.data.type === 'chatgpt-export/cancel') {
+        clearInterval(waiting);
         window.removeEventListener('message', receive);
         exportSection.hidden = false;
         status.textContent = 'ChatGPT не передал архив.';
         return;
       }
       if (event.data.type !== 'chatgpt-export/archive') return;
+      clearInterval(waiting);
       const batches = event.data.format === 3 ? event.data.archives
         : event.data.format === 2 ? [event.data.archive] : null;
       const accepted = Array.isArray(batches) && batches.length > 0
@@ -121,24 +135,57 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
   }
 }
 
+function uploadArchive(archive, update) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('POST', '/chatgpt-import/upload');
+    request.responseType = 'json';
+    request.setRequestHeader('Content-Type', 'application/zip');
+    request.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable) update(`Отправляю данные (${Math.floor(100 * event.loaded / event.total)}%)`, false);
+    });
+    request.upload.addEventListener('load', () => update('Данные отправлены. Сервис переносит записи в Open WebUI'));
+    request.addEventListener('load', () => resolve({
+      ok: request.status >= 200 && request.status < 300, status: request.status, data: request.response,
+    }));
+    request.addEventListener('error', reject);
+    request.addEventListener('abort', reject);
+    request.send(archive);
+  });
+}
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!archives.length || button.disabled) return;
   button.disabled = true;
   const total = completed + archives.length;
+  let phase, started;
+  const render = () => {
+    const seconds = Math.floor((performance.now() - started) / 1000);
+    status.textContent = `Часть ${completed + 1} из ${total}. ${phase} · ${seconds} с на этом этапе.`;
+  };
+  const update = (message, reset = true) => {
+    phase = message;
+    if (reset) started = performance.now();
+    render();
+  };
+  const timer = setInterval(render, 1000);
   try {
     while (archives.length) {
       const archive = archives[0];
-      status.textContent = `Импортирую часть ${completed + 1} из ${total}. Оставьте страницу открытой.`;
+      update('Проверяю сессию Open WebUI');
       const check = await fetch('/chatgpt-import/upload/check', {
         method: 'POST', credentials: 'same-origin',
         headers: {'X-Archive-Size': String(archive.size)},
       });
-      const response = check.ok ? await fetch('/chatgpt-import/upload', {
-        method: 'POST', credentials: 'same-origin', body: archive,
-        headers: {'Content-Type': 'application/zip'},
-      }) : check;
-      const data = await response.json().catch(() => null);
+      let response;
+      if (check.ok) {
+        update('Отправляю данные');
+        response = await uploadArchive(archive, update);
+      } else {
+        response = {ok: false, status: check.status, data: await check.json().catch(() => null)};
+      }
+      const {data} = response;
       if (!response.ok || !data?.import) {
         status.textContent = response.status === 413
           ? 'Часть данных не помещается в лимит сервиса. Обратитесь в поддержку.'
@@ -167,6 +214,7 @@ form.addEventListener('submit', async (event) => {
   } catch {
     status.textContent = 'Связь с сервисом прервалась. Нажмите «Импортировать», чтобы продолжить.';
   } finally {
+    clearInterval(timer);
     button.disabled = false;
   }
 });

@@ -33,7 +33,7 @@
       display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif">
       <div style="background:#1e293b;border-radius:16px;padding:40px;max-width:500px;width:90%;color:#e2e8f0;box-shadow:0 25px 50px rgba(0,0,0,0.4)">
         <h2 style="margin:0 0 8px;font-size:20px;color:#f8fafc">ChatGPT Exporter</h2>
-        <p id="cge-status" style="color:#94a3b8;font-size:14px;margin:0 0 20px">Starting...</p>
+        <p id="cge-status" role="status" style="color:#94a3b8;font-size:14px;margin:0 0 20px"></p>
         <div style="width:100%;height:8px;background:#334155;border-radius:4px;overflow:hidden;margin-bottom:8px">
           <div id="cge-bar" style="height:100%;background:#3b82f6;border-radius:4px;transition:width 0.3s;width:0%"></div>
         </div>
@@ -46,32 +46,39 @@
     status: overlay.querySelector("#cge-status"),
     bar: overlay.querySelector("#cge-bar"),
     detail: overlay.querySelector("#cge-detail"),
-    set(status, pct, detail) {
-      if (status) this.status.textContent = status;
+    timer: null,
+    set(status, pct, detail = "") {
+      clearInterval(this.timer);
+      this.status.textContent = status;
       if (pct != null) this.bar.style.width = pct + "%";
-      if (detail) this.detail.textContent = detail;
+      this.detail.textContent = detail;
+    },
+    wait(status, pct, detail) {
+      this.set(status, pct, detail);
+      const started = performance.now();
+      this.timer = setInterval(() => {
+        const seconds = Math.floor((performance.now() - started) / 1000);
+        this.status.textContent = `${status} · ${seconds} с на этом этапе`;
+      }, 1000);
     },
     done(msg) {
       overlay.dataset.exporting = "false";
-      this.status.textContent = msg;
-      this.bar.style.width = "100%";
+      this.set(msg, 100, "Нажмите в любом месте, чтобы закрыть окно.");
       this.bar.style.background = "#22c55e";
-      this.detail.textContent = "You can close this overlay by clicking anywhere.";
       overlay.querySelector("div").style.cursor = "pointer";
       overlay.addEventListener("click", () => overlay.remove());
     },
     error(msg) {
       overlay.dataset.exporting = "false";
-      this.status.textContent = msg;
+      this.set(msg, null, "Нажмите в любом месте, чтобы закрыть окно.");
       this.bar.style.background = "#ef4444";
-      this.detail.textContent = "Click anywhere to close.";
       overlay.addEventListener("click", () => overlay.remove());
     },
   };
 
   // ── Get token ───────────────────────────────────────────────────────
 
-  ui.set("Getting session token...");
+  ui.wait("Проверяю сессию ChatGPT");
   let token;
   let accountId;
   try {
@@ -80,7 +87,7 @@
     accountId = session.account?.id;
     if (!token) throw new Error("No accessToken in session");
   } catch {
-    ui.error("Failed to get session token. Are you logged in?");
+    ui.error("Не удалось получить сессию. Проверьте вход в ChatGPT.");
     return;
   }
 
@@ -204,32 +211,29 @@
 
   // ── Fetch conversation list ─────────────────────────────────────────
 
-  ui.set("Fetching conversation list...");
   const conversations = [];
   let offset = 0;
   try {
     while (true) {
+      ui.wait(`Запрашиваю список чатов. Получено: ${conversations.length}`);
       const data = await apiGet(`conversations?offset=${offset}&limit=${PAGE_SIZE}`);
       const items = data.items || [];
       if (!items.length) break;
       conversations.push(...items);
       const total = data.total || conversations.length;
-      ui.set(`Fetching conversation list... ${conversations.length}/${total}`);
       offset += PAGE_SIZE;
       if (offset >= total) break;
       await sleep(DELAY);
     }
   } catch (e) {
-    ui.error(`Failed to fetch conversations: ${e.message}`);
+    ui.error(`Не удалось получить список чатов (${e.message}).`);
     return;
   }
 
   if (!conversations.length) {
-    ui.done("No conversations found.");
+    ui.done("В ChatGPT нет чатов для переноса.");
     return;
   }
-
-  ui.set(`Found ${conversations.length} conversations. Downloading...`);
 
   // ── Download conversations and files ────────────────────────────────
 
@@ -243,16 +247,20 @@
     const { id: cid, title: rawTitle } = conversations[i];
     const title = rawTitle || "Untitled";
     const fname = `${sanitize(title)}_${cid.slice(0, 8)}`;
-    const pct = Math.round(((i + 1) / total) * 100);
+    const pct = Math.round((i / total) * 100);
+    const chat = `Чат ${i + 1} из ${total}`;
 
-    ui.set(`Downloading ${i + 1} of ${total} (${pct}%)`, pct, title);
+    ui.wait(`${chat}. Получаю сообщения из ChatGPT`, pct, title);
 
     try {
       const convo = await apiGet(`conversation/${cid}`);
       const entries = [{ path: `json/${fname}.json`, data: JSON.stringify(convo) }];
 
       const usedNames = new Set();
-      for (const [fileId, fallbackName] of extractFileReferences(convo)) {
+      const files = extractFileReferences(convo);
+      let fileNumber = 0;
+      for (const [fileId, fallbackName] of files) {
+        ui.wait(`${chat}. Скачиваю вложение ${++fileNumber} из ${files.size}`, pct, `${title} · ${fallbackName}`);
         totalFiles++;
         try {
           const { filename, data } = await downloadFile(fileId, fallbackName);
@@ -277,13 +285,14 @@
     ui.error("Не удалось выгрузить ни одной беседы.");
     return;
   }
+  ui.wait("Получаю сводку памяти и пользовательские инструкции", 100);
   const [summary, preferences] = await personalization;
   const memory = { memory_summary: summary, user_preferences: preferences };
 
   const failed = total - downloaded;
   let doneMsg = `Данные переданы на страницу импорта. Бесед ${downloaded}/${total}.`;
-  if (failed) doneMsg += ` (${failed} failed)`;
-  if (totalFiles) doneMsg += ` ${totalFiles - failedFiles}/${totalFiles} files downloaded.`;
+  if (failed) doneMsg += ` Не выгружено чатов: ${failed}.`;
+  if (totalFiles) doneMsg += ` Вложений: ${totalFiles - failedFiles}/${totalFiles}.`;
   ui.set(`Готово к импорту. Бесед ${downloaded}/${total}.`, 100);
   const openImport = document.createElement("button");
   openImport.type = "button";
@@ -298,7 +307,7 @@
       return;
     }
     openImport.disabled = true;
-    ui.set("Передаю данные во вкладку импорта…");
+    ui.wait("Ожидаю готовности вкладки импорта");
     try {
       await transfer.send((limit) => buildArchiveBatches(chatEntries, memory, limit));
       chatEntries.length = 0;
@@ -348,7 +357,8 @@
           if (tab.closed) throw new Error("Import tab was closed");
           const limit = await wait(ready);
           if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Missing archive limit");
-          const archives = buildBatches(limit);
+          const archives = await buildBatches(limit);
+          ui.wait("Передаю данные и ожидаю подтверждения вкладки импорта");
           tab.postMessage({ type: "chatgpt-export/archive", transfer: transferId, format: 3, archives }, target.origin);
           if (!await wait(received)) throw new Error("Import tab rejected the archive");
         } finally {
@@ -367,7 +377,7 @@
 
   // ── ZIP serialization ───────────────────────────────────────────────
 
-  function buildArchiveBatches(chats, memory, limit) {
+  async function buildArchiveBatches(chats, memory, limit) {
     const encoder = new TextEncoder();
     const entrySize = ({ path, data }) => 76 + 2 * encoder.encode(path).length
       + (typeof data === "string" ? encoder.encode(data).length : data.length);
@@ -375,11 +385,17 @@
     const overhead = 22 + entrySize(personalization);
     const target = Math.min(limit, 96 * 1024 * 1024);
     const archives = [];
-    let entries = [], size = overhead, count = 0;
+    let entries = [], size = overhead, count = 0, packed = 0;
+    async function pack() {
+      ui.wait(`Собираю часть ${archives.length + 1}. Подготовлено чатов: ${packed} из ${chats.length}`);
+      await sleep(0);
+      archives.push(await buildZipBlob(entries));
+      packed += count;
+    }
     for (const chat of chats) {
       const chatSize = chat.reduce((total, entry) => total + entrySize(entry), 0);
       if (count && (size + chatSize > target || count >= 100 || entries.length + chat.length >= 30000)) {
-        archives.push(buildZipBlob(entries));
+        await pack();
         entries = [];
         size = overhead;
         count = 0;
@@ -389,25 +405,30 @@
       count++;
     }
     entries.push(personalization);
-    archives.push(buildZipBlob(entries));
+    await pack();
     return archives;
   }
 
-  function buildZipBlob(entries) {
+  async function buildZipBlob(entries) {
     if (entries.length > 0xffff) throw new Error("Too many ZIP entries");
     const te = new TextEncoder();
     const parts = [];
     const cdParts = [];
     let offset = 0;
+    let yieldAfter = performance.now() + 100;
 
     for (const entry of entries) {
+      if (performance.now() >= yieldAfter) {
+        await sleep(0);
+        yieldAfter = performance.now() + 100;
+      }
       const pathBytes = te.encode(entry.path);
       const data = typeof entry.data === "string" ? te.encode(entry.data) : entry.data;
       const length = data.length;
       if (pathBytes.length > 0xffff || offset + 30 + pathBytes.length + length > 0xffffffff) {
         throw new Error("ZIP size limit exceeded");
       }
-      const crc = crc32(data);
+      const crc = await crc32(data);
 
       // Local file header (30 bytes)
       const lh = new DataView(new ArrayBuffer(30));
@@ -456,7 +477,7 @@
     });
   }
 
-  function crc32(bytes) {
+  async function crc32(bytes) {
     const table = new Uint32Array(256);
     for (let i = 0; i < 256; i++) {
       let c = i;
@@ -464,7 +485,12 @@
       table[i] = c;
     }
     let crc = 0xffffffff;
-    for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    const blockSize = 16 * 1024 * 1024;
+    for (let start = 0; start < bytes.length; start += blockSize) {
+      if (start) await sleep(0);
+      const end = Math.min(start + blockSize, bytes.length);
+      for (let i = start; i < end; i++) crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    }
     return (crc ^ 0xffffffff) >>> 0;
   }
 })(/* OPEN_WEBUI_IMPORT_PAGE */ null);
