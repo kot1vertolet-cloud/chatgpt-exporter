@@ -264,8 +264,10 @@ def match_projects(conversations, records, warnings):
 
 
 class AssetIndex:
-    def __init__(self, assets, warnings):
+    def __init__(self, assets, warnings, diagnostics):
         self.warnings = warnings
+        self.diagnostics = diagnostics
+        self.message = None
         self.paths = {path_key(str(path)): path for path in assets}
         self.aliases = defaultdict(set)
         self.images_by_geometry = defaultdict(set)
@@ -315,6 +317,11 @@ class AssetIndex:
             return next(iter(candidates))
         if report:
             self.warnings['ambiguous_attachment' if candidates else 'missing_attachment'] += 1
+        file_id = next((source_name(value) for value in ids if value), None)
+        self.diagnostics.append({
+            'stage': 'Привязка вложения', 'chat': conversation, 'message': self.message, 'file': file_id,
+            'reason': 'Найдено несколько подходящих файлов' if candidates else 'Файл не найден в выгрузке',
+        })
         return None
 
 
@@ -561,16 +568,18 @@ def generated_image_message(message, assets, conversation):
     }
 
 
-def convert(conversations, projects, assets, warnings):
+def convert(conversations, projects, assets, warnings, diagnostics):
     names, memberships = match_projects(conversations, projects, warnings)
-    index = AssetIndex(assets, warnings)
+    index = AssetIndex(assets, warnings, diagnostics)
     output = []
     for cid, row in conversations.items():
         mapping = row['mapping']
         if any(not isinstance(node, dict) for node in mapping.values()):
+            diagnostics.append({'stage': 'Разбор чата', 'chat': cid, 'reason': 'Некорректный узел в истории'})
             raise ImportFailure('Invalid node in conversation mapping')
         visible = {}
         for nid, node in mapping.items():
+            index.message = nid
             message = node.get('message')
             if not isinstance(message, dict):
                 continue
@@ -579,6 +588,7 @@ def convert(conversations, projects, assets, warnings):
                 visible[nid] = converted
         if not visible:
             warnings['conversation_without_visible_messages'] += 1
+            diagnostics.append({'stage': 'Разбор чата', 'chat': cid, 'reason': 'Чат пропущен: нет видимых сообщений'})
             continue
         nearest = {None: None}
 
@@ -586,6 +596,7 @@ def convert(conversations, projects, assets, warnings):
             trail, seen = [], set()
             while node_id not in nearest:
                 if node_id in seen:
+                    diagnostics.append({'stage': 'Разбор чата', 'chat': cid, 'reason': 'Цикл в истории сообщений'})
                     raise ImportFailure('Cycle in conversation mapping')
                 seen.add(node_id)
                 if node_id not in mapping:
@@ -1005,8 +1016,11 @@ def server_preflight(api, user, upload_limit, upload_sizes, need_folders):
         raise ImportFailure(f'An upload exceeds the effective {limit // MIB} MiB limit')
 
 
-def apply_import(api, user, export, chats, projects, assets, *, upload_limit, journal_path):
+def apply_import(api, user, export, chats, projects, assets, *, upload_limit, journal_path, diagnostics):
     associated = {path for chat in chats for path in chat['assets']}
+    for path in sorted(assets.keys() - associated):
+        diagnostics.append({'stage': 'Привязка вложения', 'file': assets[path]['sha256'],
+                            'reason': 'Файл получен, связь с видимым сообщением не установлена'})
     server_preflight(api, user, upload_limit, (assets[path]['size'] for path in associated), bool(projects))
     attachment_sizes = {assets[path]['sha256']: assets[path]['size'] for path in associated}
 
@@ -1017,6 +1031,8 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
             try:
                 memories = api.get(API + '/memories/')
             except RequestFailure as error:
+                for path in dict.fromkeys(path for path, _, _ in export.personalization):
+                    diagnostics.append({'stage': 'Импорт памяти', 'section': path, 'reason': str(error)})
                 if error.status == 403:
                     raise ImportFailure('Память Open WebUI недоступна для этого аккаунта.') from None
                 raise
@@ -1050,24 +1066,41 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
                     if path not in references:
                         info = assets[path]
                         mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
-                        with export.read(path) as handle:
-                            ident = migration.file(handle, path.name, mime, info['size'], info['sha256'])
+                        try:
+                            with export.read(path) as handle:
+                                ident = migration.file(handle, path.name, mime, info['size'], info['sha256'])
+                        except ImportFailure as error:
+                            diagnostics.append({'stage': 'Импорт вложения', 'chat': chat['id'],
+                                                'file': info['sha256'], 'reason': str(error)})
+                            raise
                         references[path] = file_reference(ident, path.name, mime, info['size'])
 
             def write_chat():
                 payload = chat_payload(chat, user['id'], references, marker, folder_ids.get(chat['project']))
                 return migration.import_chat(payload)
 
-            migration.ensure('chat', marker, write_chat, prepare_files)
+            changed = migration.counts['conversation_changed']
+            try:
+                migration.ensure('chat', marker, write_chat, prepare_files)
+            except ImportFailure as error:
+                diagnostics.append({'stage': 'Импорт чата', 'chat': chat['id'], 'reason': str(error)})
+                raise
+            if migration.counts['conversation_changed'] > changed:
+                diagnostics.append({'stage': 'Импорт чата', 'chat': chat['id'],
+                                    'reason': 'Исходная версия изменилась. Существующий чат сохранён'})
         existing_memories = {(item.get('path'), item.get('type'), item.get('content'))
                              for item in memories if isinstance(item, dict)}
-        for path, kind, content in export.personalization:
+        for number, (path, kind, content) in enumerate(export.personalization, 1):
             if (path, kind, content) in existing_memories:
                 migration.counts['memory_unchanged'] += 1
                 continue
-            item = api.post(API + '/memories/add', {'path': path, 'type': kind, 'content': content})
-            if not isinstance(item, dict) or (item.get('path'), item.get('type'), item.get('content')) != (path, kind, content):
-                raise ImportFailure('Open WebUI не подтвердил добавление записи памяти.')
+            try:
+                item = api.post(API + '/memories/add', {'path': path, 'type': kind, 'content': content})
+                if not isinstance(item, dict) or (item.get('path'), item.get('type'), item.get('content')) != (path, kind, content):
+                    raise ImportFailure('Open WebUI не подтвердил добавление записи памяти.')
+            except ImportFailure as error:
+                diagnostics.append({'stage': 'Импорт памяти', 'section': f'{path}, запись {number}', 'reason': str(error)})
+                raise
             existing_memories.add((path, kind, content))
             migration.counts['memory_written'] += 1
         return {'import': dict(migration.counts), 'files_unlinked': len(assets) - len(associated)}

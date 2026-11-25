@@ -22,6 +22,20 @@
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const events = [];
+  function failureReason(error) {
+    if (/^HTTP [1-5]\d\d$/.test(error.message)) return error.message;
+    if (error.name === 'TimeoutError') return 'Истекло время ожидания ответа ChatGPT';
+    if (error.message === 'No download_url') return 'ChatGPT не дал ссылку на скачивание';
+    if (error instanceof TypeError) return 'Сетевой сбой при получении данных';
+    if (error instanceof SyntaxError) return 'Некорректный ответ ChatGPT';
+    return 'Не удалось обработать полученные данные';
+  }
+
+  const reportMemoryFailure = (section, error) => {
+    events.push({ stage: 'Выгрузка памяти', section, reason: failureReason(error) });
+    return null;
+  };
 
   // ── UI overlay ──────────────────────────────────────────────────────
 
@@ -86,9 +100,8 @@
     token = session.accessToken;
     accountId = session.account?.id;
     if (!token) throw new Error("No accessToken in session");
-  } catch {
-    ui.error("Не удалось получить сессию. Проверьте вход в ChatGPT.");
-    return;
+  } catch (error) {
+    events.push({ stage: 'Получение сессии ChatGPT', reason: token ? failureReason(error) : 'Сессия ChatGPT недоступна' });
   }
 
   // ── API helper ──────────────────────────────────────────────────────
@@ -136,13 +149,22 @@
     return summary.length ? summary : null;
   }
 
-  const personalization = Promise.all([
-    readMemorySummary().catch(() => null),
+  const personalization = token ? Promise.all([
+    readMemorySummary().then((summary) => {
+      if (summary === null) events.push({ stage: 'Выгрузка памяти', section: 'Сводка памяти', reason: 'ChatGPT вернул пустую сводку' });
+      return summary;
+    }).catch((error) => reportMemoryFailure('Сводка памяти', error)),
     apiGet("user_system_messages", { headers: personalizationHeaders, signal: AbortSignal.timeout(30000) }).then((data) => {
-      if (data.enabled === false) return "";
-      return typeof data.about_model_message === "string" ? data.about_model_message : null;
-    }).catch(() => null),
-  ]);
+      if (data.enabled === false) {
+        events.push({ stage: 'Выгрузка памяти', section: 'Пользовательские инструкции', reason: 'Инструкции отключены в ChatGPT' });
+        return '';
+      }
+      if (typeof data.about_model_message !== 'string' || !data.about_model_message.trim()) {
+        events.push({ stage: 'Выгрузка памяти', section: 'Пользовательские инструкции', reason: 'ChatGPT не вернул текст инструкций' });
+      }
+      return typeof data.about_model_message === 'string' ? data.about_model_message : null;
+    }).catch((error) => reportMemoryFailure('Пользовательские инструкции', error)),
+  ]) : Promise.resolve([null, null]);
 
   const MIME_TO_EXT = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
@@ -177,9 +199,11 @@
     return references;
   }
 
-  async function downloadFile(fileId, fallbackName) {
+  async function downloadFile(fileId, fallbackName, updateStage) {
+    updateStage('Запрос ссылки на вложение');
     const meta = await apiGet(`files/download/${fileId}`);
     if (!meta.download_url) throw new Error("No download_url");
+    updateStage('Скачивание вложения');
     const response = await fetch(meta.download_url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const contentType = response.headers.get("content-type") || "";
@@ -230,7 +254,7 @@
   const conversations = [];
   let offset = 0;
   try {
-    while (true) {
+    while (token) {
       ui.wait(`Запрашиваю список чатов. Получено: ${conversations.length}`);
       const data = await apiGet(`conversations?offset=${offset}&limit=${PAGE_SIZE}`);
       const items = data.items || [];
@@ -242,23 +266,21 @@
       await sleep(DELAY);
     }
   } catch (e) {
-    ui.error(`Не удалось получить список чатов (${e.message}).`);
-    return;
+    events.push({ stage: 'Получение списка чатов', reason: failureReason(e) });
   }
 
-  if (!conversations.length) {
-    ui.done("В ChatGPT нет чатов для переноса.");
-    return;
+  if (!conversations.length && !events.length) {
+    events.push({ stage: 'Получение списка чатов', reason: 'ChatGPT не вернул ни одного чата' });
   }
 
   // ── Download conversations and files ────────────────────────────────
 
   const chatEntries = [];
   const failures = { chats: {}, files: {} };
-  function recordFailure(group, error) {
-    const reason = /^HTTP [1-5]\d\d$/.test(error.message) ? error.message
-      : error.message === 'No download_url' ? 'ChatGPT не дал ссылку' : 'Ошибка получения данных';
+  function recordFailure(group, error, context) {
+    const reason = failureReason(error);
     group[reason] = (group[reason] || 0) + 1;
+    events.push({ ...context, reason });
   }
   let totalFiles = 0;
   let failedFiles = 0;
@@ -286,30 +308,28 @@
       for (const [fileId, fallbackName] of files) {
         ui.wait(`${chat}. Скачиваю вложение ${++fileNumber} из ${files.size}`, pct, `${title} · ${fallbackName}`);
         totalFiles++;
+        let stage;
         try {
-          const { filename, data } = await retryRead(() => downloadFile(fileId, fallbackName));
+          const { filename, data } = await retryRead(() => downloadFile(fileId, fallbackName, (value) => { stage = value; }));
+          stage = 'Упаковка вложения';
           const actualName = attachmentPath(filename, fileId, usedNames);
           entries.push({ path: `files/${fname}/${actualName}`, data });
           await sleep(DELAY);
         } catch (error) {
           failedFiles++;
-          recordFailure(failures.files, error);
+          recordFailure(failures.files, error, { stage, chat: cid, file: fileId });
         }
       }
 
       chatEntries.push(entries);
       downloaded++;
     } catch (error) {
-      recordFailure(failures.chats, error);
+      recordFailure(failures.chats, error, { stage: 'Выгрузка чата', chat: cid });
     }
 
     await sleep(DELAY);
   }
 
-  if (!downloaded) {
-    ui.error("Не удалось выгрузить ни одной беседы.");
-    return;
-  }
   ui.wait("Получаю сводку памяти и пользовательские инструкции", 100);
   const [summary, preferences] = await personalization;
   const memory = { memory_summary: summary, user_preferences: preferences };
@@ -318,7 +338,7 @@
   let doneMsg = `Данные переданы на страницу импорта. Бесед ${downloaded}/${total}.`;
   if (failed) doneMsg += ` Не выгружено чатов: ${failed}.`;
   if (totalFiles) doneMsg += ` Вложений: ${totalFiles - failedFiles}/${totalFiles}.`;
-  ui.set(`Готово к импорту. Бесед ${downloaded}/${total}.`, 100);
+  ui.set(downloaded ? `Готово к импорту. Бесед ${downloaded}/${total}.` : 'Чаты не выгружены. Откройте вкладку импорта, чтобы сохранить журнал.', 100);
   const openImport = document.createElement("button");
   openImport.type = "button";
   openImport.textContent = "Открыть вкладку импорта";
@@ -334,8 +354,8 @@
     openImport.disabled = true;
     ui.wait("Ожидаю готовности вкладки импорта");
     try {
-      await transfer.send((limit) => buildArchiveBatches(chatEntries, memory, limit), {
-        chats: total, exportedChats: downloaded, files: totalFiles, downloadedFiles: totalFiles - failedFiles, failures,
+      await transfer.send((limit) => chatEntries.length ? buildArchiveBatches(chatEntries, memory, limit) : [], {
+        chats: total, exportedChats: downloaded, files: totalFiles, downloadedFiles: totalFiles - failedFiles, failures, events,
       });
       chatEntries.length = 0;
       openImport.remove();

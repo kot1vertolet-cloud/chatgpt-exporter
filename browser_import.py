@@ -13,19 +13,22 @@ import socket
 import sqlite3
 import sys
 from threading import BoundedSemaphore
+from time import time
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 import zipfile
 
 from import_chatgpt import (
     API, MIB, Export, ImportFailure, RequestFailure, UnconfirmedWrite, WebUI,
-    apply_import, convert,
+    apply_import, convert, remote_id,
 )
 
 
 ROOT = '/chatgpt-import/'
 POST = ROOT + 'upload'
 CHECK = POST + '/check'
+REPORT = ROOT + 'journal'
+REPORT_MARKER = 'chatgpt_migration_journal'
 EXPORT_SCRIPT = Path(__file__).with_name('convert.js')
 GUIDE_GIF = Path(__file__).with_name('chatgpt-import.gif')
 EXPORT_TARGET = '/* OPEN_WEBUI_IMPORT_PAGE */ null'
@@ -74,6 +77,9 @@ const exportSection = document.querySelector('#export-bookmark-section');
 let archives = [];
 let completed = 0;
 let exportReport;
+let reportId;
+let reportPending = false;
+const importEvents = [];
 const totals = { counts: {}, warnings: {}, unlinked: 0, unavailable: new Set() };
 const warningLabels = {
   project_without_id: 'Проект без ID',
@@ -128,13 +134,16 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
       clearInterval(waiting);
       const batches = event.data.format === 3 ? event.data.archives
         : event.data.format === 2 ? [event.data.archive] : null;
-      const accepted = Array.isArray(batches) && batches.length > 0
+      const accepted = Array.isArray(batches) && (batches.length > 0 || event.data.report?.events?.length > 0)
         && batches.every((archive) => archive instanceof Blob && archive.size > 0);
       if (accepted) {
         archives = batches;
         exportReport = event.data.report;
+        reportPending = true;
+        if (!archives.length) button.textContent = 'Сохранить журнал';
         form.hidden = false;
-        status.textContent = 'Данные из ChatGPT получены. Нажмите «Импортировать».';
+        status.textContent = archives.length ? 'Данные из ChatGPT получены. Нажмите «Импортировать».'
+          : 'Выгрузка завершилась без чатов. Причины будут записаны в журнал.';
         history.replaceState(null, '', location.pathname);
       } else {
         exportSection.hidden = false;
@@ -171,9 +180,37 @@ function uploadArchive(archive, update) {
   });
 }
 
+async function saveJournal(state, total) {
+  reportPending = true;
+  const lines = [`Состояние: ${state}`, `Обработано частей: ${completed} из ${total}`];
+  if (exportReport) {
+    lines.push(`Чатов выгружено: ${exportReport.exportedChats} из ${exportReport.chats}`,
+      `Вложений скачано: ${exportReport.downloadedFiles} из ${exportReport.files}`);
+  }
+  if (completed) {
+    lines.push(`Чатов добавлено: ${totals.counts.conversation_written || 0}`,
+      `Файлов добавлено: ${totals.counts.attachment_written || 0}`,
+      `Записей памяти добавлено: ${totals.counts.memory_written || 0}`);
+  }
+  if (totals.unavailable.size) lines.push(`ChatGPT не вернул: ${[...totals.unavailable].join(', ')}`);
+  for (const event of [...(exportReport?.events || []), ...importEvents]) {
+    const subject = [event.chat && `чат ${event.chat}`, event.file && `вложение ${event.file}`,
+      event.message && `сообщение ${event.message}`, event.section].filter(Boolean).join(', ');
+    lines.push(`${event.stage}${subject ? ` (${subject})` : ''}: ${event.reason}`);
+  }
+  const response = await fetch('/chatgpt-import/journal', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({run: transferId, id: reportId, text: lines.join('\\n')}),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.id) throw new Error('Open WebUI не сохранил журнал миграции');
+  reportId = data.id;
+  reportPending = false;
+}
+
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!archives.length || button.disabled) return;
+  if ((!archives.length && !reportPending) || button.disabled) return;
   button.disabled = true;
   const total = completed + archives.length;
   let phase, started;
@@ -188,6 +225,8 @@ form.addEventListener('submit', async (event) => {
   };
   const timer = setInterval(render, 1000);
   try {
+    update('Сохраняю журнал миграции в Open WebUI');
+    await saveJournal(archives.length ? 'Импорт начат' : completed ? 'Импорт завершён' : 'Выгрузка завершена', total);
     while (archives.length) {
       const archive = archives[0];
       update('Проверяю сессию Open WebUI');
@@ -203,7 +242,10 @@ form.addEventListener('submit', async (event) => {
         response = {ok: false, status: check.status, data: await check.json().catch(() => null)};
       }
       const {data} = response;
+      for (const detail of data?.diagnostics || []) importEvents.push(detail);
       if (!response.ok || !data?.import) {
+        importEvents.push({ stage: `Импорт части ${completed + 1}`, reason: data?.error || `HTTP ${response.status}` });
+        await saveJournal('Импорт прерван', total);
         status.textContent = response.status === 413
           ? 'Часть данных не помещается в лимит сервиса. Обратитесь в поддержку.'
           : data?.error || 'Импорт прервался. Нажмите «Импортировать», чтобы продолжить.';
@@ -219,6 +261,7 @@ form.addEventListener('submit', async (event) => {
       for (const section of data.personalization_unavailable) totals.unavailable.add(section);
       archives.shift();
       completed++;
+      await saveJournal(archives.length ? 'Импорт продолжается' : 'Импорт завершён', total);
     }
     const counts = totals.counts;
     status.textContent = '';
@@ -242,8 +285,13 @@ form.addEventListener('submit', async (event) => {
       status.textContent += ` ChatGPT не вернул следующие разделы: ${[...totals.unavailable].join(', ')}.`;
     }
     form.hidden = true;
-  } catch {
-    status.textContent = 'Связь с сервисом прервалась. Нажмите «Импортировать», чтобы продолжить.';
+  } catch (error) {
+    if (!reportPending) {
+      importEvents.push({ stage: `Импорт части ${completed + 1}`, reason: 'Связь с сервисом прервалась' });
+      try { await saveJournal('Импорт прерван', total); } catch { /* Сохраняем журнал в памяти вкладки для повтора. */ }
+    }
+    status.textContent = reportPending ? 'Журнал пока не сохранён. Повторите действие в этой вкладке.'
+      : 'Связь с сервисом прервалась. Нажмите «Импортировать», чтобы продолжить.';
   } finally {
     clearInterval(timer);
     button.disabled = false;
@@ -291,6 +339,8 @@ class BrowserImport(BaseHTTPRequestHandler):
             pass
 
     def json(self, status, payload):
+        if self.path == POST and getattr(self, 'diagnostics', None):
+            payload['diagnostics'] = self.diagnostics
         self.reply(status, 'application/json; charset=utf-8', json.dumps(payload, ensure_ascii=False).encode('utf-8'))
 
     def do_GET(self):
@@ -364,6 +414,41 @@ class BrowserImport(BaseHTTPRequestHandler):
             remaining -= len(block)
         buffer.seek(0)
 
+    def save_journal(self):
+        lengths = self.headers.get_all('Content-Length', [])
+        if (self.headers.get_content_type() != 'application/json' or len(lengths) != 1
+                or not lengths[0].isascii() or not lengths[0].isdigit() or len(lengths[0]) > 8
+                or not 0 < int(lengths[0]) <= 4 * MIB):
+            raise UploadError(400, 'Неверный запрос сохранения журнала.')
+        api, user = self.authenticated_user()
+        payload = json.loads(self.rfile.read(int(lengths[0])))
+        run = str(UUID(payload['run']))
+        text = payload['text']
+        if not isinstance(text, str) or not text.strip():
+            raise UploadError(400, 'Журнал пуст.')
+        content = '\n'.join('    ' + line for line in text.splitlines())
+        chat_id = payload.get('id')
+        if not chat_id:
+            # A retry after a lost response must find the journal created by the first request.
+            record = next((row for row in api.chats() if row.get('user_id') == user['id']
+                           and (row.get('chat') or {}).get(REPORT_MARKER) == run), None)
+            chat_id = remote_id(record, user['id']) if record else None
+        if chat_id:
+            chat_id = str(UUID(chat_id))
+            route = API + '/chats/' + chat_id
+            record = api.get(route)
+            if remote_id(record, user['id']) != chat_id or (record.get('chat') or {}).get(REPORT_MARKER) != run:
+                raise UploadError(403, 'Этот чат не является журналом текущей миграции.')
+            record = api.post(f'{route}/messages/{run}', {'content': content})
+        else:
+            message = {'id': run, 'role': 'assistant', 'content': content, 'done': True,
+                       'parentId': None, 'childrenIds': [], 'timestamp': int(time())}
+            record = api.post(API + '/chats/new', {'chat': {
+                'title': 'Журнал миграции ChatGPT', REPORT_MARKER: run, 'models': [],
+                'history': {'currentId': run, 'messages': {run: message}}, 'messages': [message],
+            }})
+        return {'id': remote_id(record, user['id'])}
+
     def import_upload(self, api, user, size):
         settings = self.server.options
         with BytesIO() as archive:
@@ -374,12 +459,12 @@ class BrowserImport(BaseHTTPRequestHandler):
                 conversations, project_rows, assets = export.inventory()
                 if not conversations:
                     raise UploadError(400, 'В ZIP не найдено бесед ChatGPT.')
-                chats, projects = convert(conversations, project_rows, assets, warnings)
+                chats, projects = convert(conversations, project_rows, assets, warnings, self.diagnostics)
                 return {
                     **apply_import(
                         api, user, export, chats, projects, assets,
                         upload_limit=settings.upload_limit_mib * MIB,
-                        journal_path=settings.data_dir / f"{user['id']}.sqlite3",
+                        journal_path=settings.data_dir / f"{user['id']}.sqlite3", diagnostics=self.diagnostics,
                     ),
                     'warnings': dict(warnings),
                     'personalization_unavailable': export.personalization_unavailable,
@@ -387,14 +472,18 @@ class BrowserImport(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.close_connection = True
-        if self.path not in {POST, CHECK}:
+        if self.path not in {POST, CHECK, REPORT}:
             self.json(404, {'error': 'Страница не найдена.'})
             return
         try:
+            self.diagnostics = []
             if self.headers.get('Origin') != self.server.options.public_origin:
                 raise UploadError(403, 'Загрузите архив со страницы импорта Open WebUI.')
             if self.headers.get('Transfer-Encoding'):
                 raise UploadError(411, 'Прокси должен передавать размер загрузки.')
+            if self.path == REPORT:
+                self.json(200, self.save_journal())
+                return
             checking = self.path == CHECK
             if checking:
                 if self.headers.get_all('Content-Length', []) not in ([], ['0']):
