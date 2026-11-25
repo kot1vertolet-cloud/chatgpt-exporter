@@ -40,6 +40,10 @@ BROWSER_TAG_LENGTH = 16
 BROWSER_KDF_ROUNDS = 600_000
 MARKER = 'chatgpt_import'
 API = '/api/v1'
+PERSONALIZATION = {
+    'memory_summary': ('Сводка памяти', 'context'),
+    'user_preferences': ('Пользовательские предпочтения', 'user'),
+}
 NOT_FOUND = "We could not find what you're looking for :/"
 SOURCE_JSON = re.compile(r'(conversations|projects)(?:[_.-]?\d+)?\.json', re.I)
 LOCAL_LINK = re.compile(r'(?<=\()<?((?:sandbox:/mnt/data/|attachment:)[^)>\n]+)>?(?=\))')
@@ -209,6 +213,8 @@ class Export:
         self.max_expanded = max_expanded
         self.archive = None
         self.entries = {}
+        self.personalization = {}
+        self.personalization_unavailable = []
 
     @contextmanager
     def open(self):
@@ -268,6 +274,20 @@ class Export:
             inside_files = 'files' in directories
             structured = not inside_files and (source_kind or ('json' in directories and name.endswith('.json')))
             with self.read(path) as handle:
+                if path == PurePosixPath('personalization.json'):
+                    if length > 256 * 1024:
+                        raise ImportFailure('Файл персонализации превышает 256 КиБ.')
+                    value = json.load(handle)
+                    if not isinstance(value, dict) or any(
+                        key in value and value[key] is not None and not isinstance(value[key], str)
+                        for key in PERSONALIZATION
+                    ):
+                        raise ImportFailure('Неверный формат персонализации.')
+                    self.personalization = {key: value[key].strip() for key in PERSONALIZATION
+                                            if isinstance(value.get(key), str) and value[key].strip()}
+                    self.personalization_unavailable = [label for key, (label, _) in PERSONALIZATION.items()
+                                                        if key in value and value[key] is None]
+                    continue
                 if structured:
                     if length > 128 * MIB:
                         raise ImportFailure('A JSON entry exceeds 128 MiB')
@@ -1148,6 +1168,16 @@ def apply_import(args, export, chats, projects, assets, api=None, user=None):
 
     with journal(args.journal) as database:
         migration = Migration(api, args.user_id, database, args.retry_unconfirmed, attachment_sizes)
+        memories = []
+        if export.personalization:
+            try:
+                memories = api.get(API + '/memories/')
+            except RequestFailure as error:
+                if error.status == 403:
+                    raise ImportFailure('Память Open WebUI недоступна для этого аккаунта.') from None
+                raise
+            if not isinstance(memories, list):
+                raise ImportFailure('Open WebUI вернул неверный список записей памяти.')
         migration.refresh('chat')
         migration.refresh('file')
         folders = migration.refresh('folder') if projects else []
@@ -1185,6 +1215,17 @@ def apply_import(args, export, chats, projects, assets, api=None, user=None):
                 return migration.import_chat(payload)
 
             migration.ensure('chat', marker, write_chat, prepare_files)
+        existing_memories = {(item.get('path'), item.get('type'), item.get('content'))
+                             for item in memories if isinstance(item, dict)}
+        for key, content in export.personalization.items():
+            path, kind = PERSONALIZATION[key]
+            if (path, kind, content) in existing_memories:
+                migration.counts['memory_unchanged'] += 1
+                continue
+            item = api.post(API + '/memories/add', {'path': path, 'type': kind, 'content': content})
+            if not isinstance(item, dict) or (item.get('path'), item.get('type'), item.get('content')) != (path, kind, content):
+                raise ImportFailure('Open WebUI не подтвердил добавление записи памяти.')
+            migration.counts['memory_written'] += 1
         return {'import': dict(migration.counts)}
 
 

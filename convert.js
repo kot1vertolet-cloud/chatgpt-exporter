@@ -75,9 +75,11 @@
 
   ui.set("Getting session token...");
   let token;
+  let accountId;
   try {
     const session = await fetch("/api/auth/session").then((r) => r.json());
     token = session.accessToken;
+    accountId = session.account?.id;
     if (!token) throw new Error("No accessToken in session");
   } catch (e) {
     ui.error("Failed to get session token. Are you logged in?");
@@ -86,13 +88,55 @@
 
   // ── API helper ──────────────────────────────────────────────────────
 
-  async function apiGet(path) {
+  async function apiGet(path, options = {}) {
     const resp = await fetch(`${API}/${path}`, {
-      headers: { ...HEADERS, Authorization: `Bearer ${token}` },
+      ...options,
+      headers: { ...HEADERS, Authorization: `Bearer ${token}`, ...options.headers },
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     return resp.json();
   }
+
+  const personalizationHeaders = accountId ? { "ChatGPT-Account-ID": accountId } : {};
+
+  async function readMemorySummary() {
+    const response = await fetch(`${API}/memories/about_you/summary/stream?source=personalization-setting`, {
+      method: "POST",
+      headers: { ...HEADERS, ...personalizationHeaders, Authorization: `Bearer ${token}`, Accept: "text/event-stream" },
+      body: "{}",
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const sections = new Map();
+    let order = [];
+    for (const record of (await response.text()).split(/\r?\n\r?\n/)) {
+      const lines = record.split(/\r?\n/);
+      const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
+      if (event !== "section_types" && event !== "section") continue;
+      const data = JSON.parse(lines.filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).replace(/^ /, "")).join("\n"));
+      if (event === "section_types") {
+        order = Array.isArray(data.sections) ? data.sections.map((section) => section.id) : [];
+        continue;
+      }
+      const section = data.section;
+      if (!section?.id || typeof section.description !== "string" || !section.description.trim()) continue;
+      const description = section.description.trim();
+      const title = typeof section.title === "string" ? section.title.trim() : "";
+      sections.set(section.id, title ? `## ${title}\n\n${description}` : description);
+    }
+    return [...new Set([...order, ...sections.keys()])].map((id) => sections.get(id))
+      .filter(Boolean).join("\n\n") || null;
+  }
+
+  const personalization = Promise.all([
+    readMemorySummary().catch(() => null),
+    apiGet("user_system_messages", { headers: personalizationHeaders, signal: AbortSignal.timeout(30000) }).then((data) => {
+      if (data.enabled === false) return "";
+      return typeof data.about_model_message === "string" ? data.about_model_message : null;
+    }).catch(() => null),
+  ]);
 
   async function apiFetchBinary(url) {
     const resp = await fetch(url);
@@ -295,14 +339,8 @@
     ui.error("Не удалось выгрузить ни одной беседы.");
     return;
   }
-  ui.set("Собираю ZIP…", 100);
-  let zipBlob;
-  try {
-    zipBlob = buildZipBlob(zipEntries);
-  } catch {
-    ui.error("Не удалось создать ZIP.");
-    return;
-  }
+  const [summary, preferences] = await personalization;
+  const memory = { memory_summary: summary, user_preferences: preferences };
 
   const succeeded = total - failed;
   let doneMsg = `ZIP передан на страницу импорта. Бесед ${succeeded}/${total}.`;
@@ -324,6 +362,8 @@
     openImport.disabled = true;
     ui.set("Передаю ZIP во вкладку импорта…");
     try {
+      const entries = [...zipEntries, {path: "personalization.json", data: JSON.stringify(memory)}];
+      const zipBlob = buildZipBlob(entries);
       await transfer.send(zipBlob);
       openImport.remove();
       ui.done(doneMsg);

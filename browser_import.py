@@ -177,7 +177,11 @@ form.addEventListener('submit', async (event) => {
     status.textContent = `Добавлено чатов: ${counts.conversation_written || 0}. `
       + `Уже в истории: ${counts.conversation_unchanged || 0}. `
       + `Пропущено изменённых бесед: ${counts.conversation_changed || 0}. `
+      + `Записей памяти добавлено: ${counts.memory_written || 0}. Уже в памяти: ${counts.memory_unchanged || 0}. `
       + `Файлов без связи с сообщениями: ${data.files_unlinked}. Предупреждений: ${warnings}.`;
+    if (data.personalization_unavailable?.length) {
+      status.textContent += ` ChatGPT не вернул следующие разделы: ${data.personalization_unavailable.join(', ')}.`;
+    }
     transferredArchive = null;
     form.hidden = true;
   } catch {
@@ -324,7 +328,11 @@ class BrowserImport(BaseHTTPRequestHandler):
                     raise UploadError(400, 'В ZIP не найдено бесед ChatGPT.')
                 chats, projects = convert(conversations, project_rows, assets, warnings)
                 summary = summarize(conversations, chats, projects, assets, warnings)
-                return {**summary, **apply_import(args, export, chats, projects, assets, api=api, user=user)}
+                return {
+                    **summary,
+                    **apply_import(args, export, chats, projects, assets, api=api, user=user),
+                    'personalization_unavailable': export.personalization_unavailable,
+                }
 
     def do_POST(self):
         self.close_connection = True
