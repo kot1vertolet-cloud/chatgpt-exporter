@@ -251,16 +251,18 @@
 
   // ── Fetch conversation list ─────────────────────────────────────────
 
-  const conversations = [];
+  const conversations = new Map();
+  const projects = new Map();
+  const memberships = new Map();
   let offset = 0;
   try {
     while (token) {
-      ui.wait(`Запрашиваю список чатов. Получено: ${conversations.length}`);
+      ui.wait(`Запрашиваю список чатов. Получено: ${conversations.size}`);
       const data = await apiGet(`conversations?offset=${offset}&limit=${PAGE_SIZE}`);
       const items = data.items || [];
       if (!items.length) break;
-      conversations.push(...items);
-      const total = data.total || conversations.length;
+      for (const item of items) if (item?.id) conversations.set(item.id, item);
+      const total = data.total || conversations.size;
       offset += PAGE_SIZE;
       if (offset >= total) break;
       await sleep(DELAY);
@@ -269,7 +271,53 @@
     events.push({ stage: 'Получение списка чатов', reason: failureReason(e) });
   }
 
-  if (!conversations.length && !events.length) {
+  async function readProjectPages(path, params, accept) {
+    const query = new URLSearchParams(params);
+    const seen = new Set();
+    do {
+      const page = await retryRead(() => apiGet(`${path}?${query}`, {
+        headers: personalizationHeaders, signal: AbortSignal.timeout(30000),
+      }));
+      if (!Array.isArray(page.items)) throw new SyntaxError('Invalid project response');
+      for (const item of page.items) accept(item);
+      if (page.cursor == null || page.cursor === '') return;
+      const cursor = String(page.cursor);
+      if (seen.has(cursor)) throw new Error('Repeated project cursor');
+      seen.add(cursor);
+      query.set('cursor', cursor);
+      await sleep(DELAY);
+    } while (true);
+  }
+
+  if (token) {
+    ui.wait('Получаю список проектов ChatGPT');
+    try {
+      await readProjectPages('gizmos/snorlax/sidebar', { conversations_per_gizmo: '0', limit: '20', owned_only: 'true' }, (item) => {
+        const project = item?.gizmo?.gizmo;
+        if (typeof project?.id === 'string' && project.id) {
+          projects.set(project.id, { id: project.id, title: project.display?.name || 'Проект ChatGPT' });
+        }
+      });
+    } catch (error) {
+      events.push({ stage: 'Получение списка проектов', reason: failureReason(error) });
+    }
+    let projectNumber = 0;
+    for (const project of projects.values()) {
+      ui.wait(`Получаю чаты проекта ${++projectNumber} из ${projects.size}`, null, project.title);
+      try {
+        await readProjectPages(`gizmos/${encodeURIComponent(project.id)}/conversations`, { limit: '50', owned_only: 'true' }, (item) => {
+          if (typeof item?.id !== 'string' || !item.id) return;
+          if (!conversations.has(item.id)) conversations.set(item.id, item);
+          if (!memberships.has(item.id)) memberships.set(item.id, new Set());
+          memberships.get(item.id).add(project.id);
+        });
+      } catch (error) {
+        events.push({ stage: 'Получение чатов проекта', project: project.id, reason: failureReason(error) });
+      }
+    }
+  }
+
+  if (!conversations.size && !projects.size && !events.length) {
     events.push({ stage: 'Получение списка чатов', reason: 'ChatGPT не вернул ни одного чата' });
   }
 
@@ -284,23 +332,31 @@
   }
   let totalFiles = 0;
   let failedFiles = 0;
-  const total = conversations.length;
+  const total = conversations.size;
   let downloaded = 0;
+  let i = 0;
+  const assignedProjects = new Set();
 
-  for (let i = 0; i < total; i++) {
-    const { id: cid, title: rawTitle } = conversations[i];
+  for (const { id: cid, title: rawTitle } of conversations.values()) {
     const title = rawTitle || "Untitled";
     const chatName = safePathComponent(title).replace(/^[. ]+/, "").slice(0, 80) || "untitled";
     const stem = `${chatName}_${cid.slice(0, 8)}`;
     const fname = isReservedName(stem) ? `_${stem}` : stem;
     const pct = Math.round((i / total) * 100);
-    const chat = `Чат ${i + 1} из ${total}`;
+    const chat = `Чат ${++i} из ${total}`;
 
     ui.wait(`${chat}. Получаю сообщения из ChatGPT`, pct, title);
 
     try {
       const convo = await retryRead(() => apiGet(`conversation/${cid}`));
       const entries = [{ path: `json/${fname}.json`, data: JSON.stringify(convo) }];
+      const projectIds = memberships.get(cid) || new Set();
+      const declaredProject = convo.project_id || convo.gizmo_id;
+      if (projects.has(declaredProject)) projectIds.add(declaredProject);
+      if (projectIds.size) {
+        const records = [...projectIds].map((id) => ({ ...projects.get(id), conversation_ids: [convo.conversation_id || convo.id || cid] }));
+        entries.push({ path: `projects.${i}.json`, data: JSON.stringify(records) });
+      }
 
       const usedNames = new Set();
       const files = extractFileReferences(convo);
@@ -322,6 +378,7 @@
       }
 
       chatEntries.push(entries);
+      for (const id of projectIds) assignedProjects.add(id);
       downloaded++;
     } catch (error) {
       recordFailure(failures.chats, error, { stage: 'Выгрузка чата', chat: cid });
@@ -338,7 +395,8 @@
   let doneMsg = `Данные переданы на страницу импорта. Бесед ${downloaded}/${total}.`;
   if (failed) doneMsg += ` Не выгружено чатов: ${failed}.`;
   if (totalFiles) doneMsg += ` Вложений: ${totalFiles - failedFiles}/${totalFiles}.`;
-  ui.set(downloaded ? `Готово к импорту. Бесед ${downloaded}/${total}.` : 'Чаты не выгружены. Откройте вкладку импорта, чтобы сохранить журнал.', 100);
+  ui.set(downloaded || projects.size ? `Готово к импорту. Бесед ${downloaded}/${total}. Проектов: ${projects.size}.`
+    : 'Чаты не выгружены. Откройте вкладку импорта, чтобы сохранить журнал.', 100);
   const openImport = document.createElement("button");
   openImport.type = "button";
   openImport.textContent = "Открыть вкладку импорта";
@@ -354,7 +412,9 @@
     openImport.disabled = true;
     ui.wait("Ожидаю готовности вкладки импорта");
     try {
-      await transfer.send((limit) => chatEntries.length ? buildArchiveBatches(chatEntries, memory, limit) : [], {
+      const otherProjects = [...projects.values()].filter(({ id }) => !assignedProjects.has(id));
+      await transfer.send((limit) => chatEntries.length || otherProjects.length
+        ? buildArchiveBatches(chatEntries, memory, limit, otherProjects) : [], {
         chats: total, exportedChats: downloaded, files: totalFiles, downloadedFiles: totalFiles - failedFiles, failures, events,
       });
       chatEntries.length = 0;
@@ -424,11 +484,12 @@
 
   // ── ZIP serialization ───────────────────────────────────────────────
 
-  async function buildArchiveBatches(chats, memory, limit) {
+  async function buildArchiveBatches(chats, memory, limit, otherProjects) {
     const encoder = new TextEncoder();
     const entrySize = ({ path, data }) => 76 + 2 * encoder.encode(path).length
       + (typeof data === "string" ? encoder.encode(data).length : data.length);
     const personalization = { path: "personalization.json", data: JSON.stringify(memory) };
+    const projectCatalog = otherProjects.length ? { path: 'projects.json', data: JSON.stringify(otherProjects) } : null;
     const overhead = 22 + entrySize(personalization);
     const target = Math.min(limit, 96 * 1024 * 1024);
     const archives = [];
@@ -451,6 +512,12 @@
       size += chatSize;
       count++;
     }
+    if (projectCatalog && entries.length && size + entrySize(projectCatalog) > target) {
+      await pack();
+      entries = [];
+      count = 0;
+    }
+    if (projectCatalog) entries.push(projectCatalog);
     entries.push(personalization);
     await pack();
     return archives;

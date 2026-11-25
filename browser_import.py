@@ -194,7 +194,7 @@ async function saveJournal(state, total) {
   }
   if (totals.unavailable.size) lines.push(`ChatGPT не вернул: ${[...totals.unavailable].join(', ')}`);
   for (const event of [...(exportReport?.events || []), ...importEvents]) {
-    const subject = [event.chat && `чат ${event.chat}`, event.file && `вложение ${event.file}`,
+    const subject = [event.project && `проект ${event.project}`, event.chat && `чат ${event.chat}`, event.file && `вложение ${event.file}`,
       event.message && `сообщение ${event.message}`, event.section].filter(Boolean).join(', ');
     lines.push(`${event.stage}${subject ? ` (${subject})` : ''}: ${event.reason}`);
   }
@@ -457,8 +457,8 @@ class BrowserImport(BaseHTTPRequestHandler):
             with zipfile.ZipFile(archive) as zip_archive:
                 export = Export(zip_archive, settings.max_expanded_mib * MIB)
                 conversations, project_rows, assets = export.inventory()
-                if not conversations:
-                    raise UploadError(400, 'В ZIP не найдено бесед ChatGPT.')
+                if not conversations and not project_rows:
+                    raise UploadError(400, 'В ZIP не найдено бесед или проектов ChatGPT.')
                 chats, projects = convert(conversations, project_rows, assets, warnings, self.diagnostics)
                 return {
                     **apply_import(
