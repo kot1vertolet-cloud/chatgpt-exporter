@@ -43,7 +43,7 @@ HTML = '''<!doctype html>
     <p>Если панели закладок под адресной строкой нет, нажмите <kbd>Ctrl+Shift+B</kbd>. Один раз перетащите синюю ссылку на эту панель. Откройте <a href="https://chatgpt.com/">ChatGPT</a> и нажмите сохранённую закладку.</p>
     <img class="import-guide" src="/chatgpt-import/chatgpt-import.gif" width="960" height="720" alt="Демонстрация переноса чатов из ChatGPT в Open WebUI">
   </section>
-  <form id="upload" hidden>
+  <form id="upload" data-archive-limit="<!-- archive limit -->" hidden>
     <button type="submit">Импортировать</button>
   </form>
   <p id="status" role="status" aria-live="polite"></p>
@@ -71,7 +71,9 @@ const status = document.querySelector('#status');
 const button = form.querySelector('button');
 const exportBookmark = document.querySelector('#export-bookmark');
 const exportSection = document.querySelector('#export-bookmark-section');
-let transferredArchive = null;
+let archives = [];
+let completed = 0;
+const totals = { counts: {}, warnings: 0, unlinked: 0, unavailable: new Set() };
 
 exportBookmark.addEventListener('click', (event) => {
   event.preventDefault();
@@ -94,24 +96,25 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
         return;
       }
       if (event.data.type !== 'chatgpt-export/archive') return;
-      const archive = event.data.archive;
-      const currentFormat = event.data.format === 2;
-      const accepted = currentFormat && archive instanceof Blob && archive.size > 0;
+      const batches = event.data.format === 3 ? event.data.archives
+        : event.data.format === 2 ? [event.data.archive] : null;
+      const accepted = Array.isArray(batches) && batches.length > 0
+        && batches.every((archive) => archive instanceof Blob && archive.size > 0);
       if (accepted) {
-        transferredArchive = archive;
+        archives = batches;
         form.hidden = false;
-        status.textContent = 'Архив из ChatGPT получен. Нажмите «Импортировать».';
+        status.textContent = 'Данные из ChatGPT получены. Нажмите «Импортировать».';
         history.replaceState(null, '', location.pathname);
       } else {
         exportSection.hidden = false;
-        status.textContent = currentFormat ? 'Из ChatGPT пришёл пустой или недопустимый файл.'
-          : 'Сработала старая закладка. Перетащите новую ссылку на панель избранного и запустите её во вкладке ChatGPT.';
+        status.textContent = 'Данные из ChatGPT не получены. Используйте закладку с этой страницы.';
       }
       window.removeEventListener('message', receive);
       sender.postMessage({type: 'chatgpt-export/received', transfer: transferId, accepted}, chatgptOrigin);
     };
     window.addEventListener('message', receive);
-    sender.postMessage({type: 'chatgpt-export/ready', transfer: transferId}, chatgptOrigin);
+    sender.postMessage({type: 'chatgpt-export/ready', transfer: transferId,
+      archiveLimit: Number(form.dataset.archiveLimit)}, chatgptOrigin);
   } else {
     exportSection.hidden = false;
     status.textContent = 'Браузер разорвал связь со вкладкой ChatGPT.';
@@ -120,46 +123,49 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!transferredArchive) return;
+  if (!archives.length || button.disabled) return;
   button.disabled = true;
-  status.textContent = 'Проверяю размер архива и сессию Open WebUI…';
+  const total = completed + archives.length;
   try {
-    const check = await fetch('/chatgpt-import/upload/check', {
-      method: 'POST', credentials: 'same-origin',
-      headers: {'X-Archive-Size': String(transferredArchive.size)},
-    });
-    if (!check.ok) {
-      const data = await check.json().catch(() => null);
-      status.textContent = data?.error || 'Сервис не разрешил загрузку архива.';
-      return;
+    while (archives.length) {
+      const archive = archives[0];
+      status.textContent = `Импортирую часть ${completed + 1} из ${total}. Оставьте страницу открытой.`;
+      const check = await fetch('/chatgpt-import/upload/check', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'X-Archive-Size': String(archive.size)},
+      });
+      const response = check.ok ? await fetch('/chatgpt-import/upload', {
+        method: 'POST', credentials: 'same-origin', body: archive,
+        headers: {'Content-Type': 'application/zip'},
+      }) : check;
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.import) {
+        status.textContent = response.status === 413
+          ? 'Часть данных не помещается в лимит сервиса. Обратитесь в поддержку.'
+          : data?.error || 'Импорт прервался. Нажмите «Импортировать», чтобы продолжить.';
+        return;
+      }
+      for (const [name, count] of Object.entries(data.import)) {
+        totals.counts[name] = (totals.counts[name] || 0) + count;
+      }
+      totals.warnings += Object.values(data.warnings).reduce((sum, count) => sum + count, 0);
+      totals.unlinked += data.files_unlinked;
+      for (const section of data.personalization_unavailable) totals.unavailable.add(section);
+      archives.shift();
+      completed++;
     }
-    status.textContent = 'Отправляю архив и импортирую чаты. Оставьте страницу открытой.';
-    const response = await fetch('/chatgpt-import/upload', {
-      method: 'POST', credentials: 'same-origin', body: transferredArchive,
-      headers: {'Content-Type': 'application/zip'},
-    });
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      status.textContent = data?.error || (response.status === 413
-        ? 'Архив превышает лимит загрузки.'
-        : 'Сервер не завершил импорт. Можно повторить отправку того же ZIP.');
-      return;
-    }
-    const counts = data.import;
-    const warnings = Object.values(data.warnings).reduce((sum, count) => sum + count, 0);
+    const counts = totals.counts;
     status.textContent = `Добавлено чатов: ${counts.conversation_written || 0}. `
       + `Уже в истории: ${counts.conversation_unchanged || 0}. `
       + `Пропущено изменённых бесед: ${counts.conversation_changed || 0}. `
       + `Записей памяти добавлено: ${counts.memory_written || 0}. Уже в памяти: ${counts.memory_unchanged || 0}. `
-      + `Файлов без связи с сообщениями: ${data.files_unlinked}. Предупреждений: ${warnings}.`;
-    if (data.personalization_unavailable?.length) {
-      status.textContent += ` ChatGPT не вернул следующие разделы: ${data.personalization_unavailable.join(', ')}.`;
+      + `Файлов без связи с сообщениями: ${totals.unlinked}. Предупреждений: ${totals.warnings}.`;
+    if (totals.unavailable.size) {
+      status.textContent += ` ChatGPT не вернул следующие разделы: ${[...totals.unavailable].join(', ')}.`;
     }
-    transferredArchive = null;
     form.hidden = true;
   } catch {
-    const size = Math.ceil(transferredArchive.size / (1024 * 1024));
-    status.textContent = `Связь с сервисом прервалась. Размер ZIP ${size} МиБ. Можно повторить отправку.`;
+    status.textContent = 'Связь с сервисом прервалась. Нажмите «Импортировать», чтобы продолжить.';
   } finally {
     button.disabled = false;
   }
@@ -219,6 +225,7 @@ class BrowserImport(BaseHTTPRequestHandler):
             return
         if self.path == ROOT:
             page = HTML.replace('<!-- exporter bookmark -->', escape(self.server.export_bookmarklet, quote=True))
+            page = page.replace('<!-- archive limit -->', str(self.server.options.archive_limit_mib * MIB))
             self.reply(200, 'text/html; charset=utf-8', page.encode('utf-8'))
             return
         if self.path == ROOT + GUIDE_GIF.name:
@@ -265,7 +272,7 @@ class BrowserImport(BaseHTTPRequestHandler):
         if not size:
             raise UploadError(400, 'Получен пустой ZIP.')
         if size > limit * MIB:
-            raise UploadError(413, f'Размер ZIP {((size + MIB - 1) // MIB)} МиБ превышает лимит {limit} МиБ.')
+            raise UploadError(413, 'Часть данных не помещается в лимит сервиса.')
         return size
 
     def receive(self, buffer, length):

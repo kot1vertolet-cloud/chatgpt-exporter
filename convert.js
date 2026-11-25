@@ -233,7 +233,7 @@
 
   // ── Download conversations and files ────────────────────────────────
 
-  const zipEntries = [];
+  const chatEntries = [];
   let totalFiles = 0;
   let failedFiles = 0;
   const total = conversations.length;
@@ -249,7 +249,7 @@
 
     try {
       const convo = await apiGet(`conversation/${cid}`);
-      const jsonStr = JSON.stringify(convo);
+      const entries = [{ path: `json/${fname}.json`, data: JSON.stringify(convo) }];
 
       const usedNames = new Set();
       for (const [fileId, fallbackName] of extractFileReferences(convo)) {
@@ -257,14 +257,14 @@
         try {
           const { filename, data } = await downloadFile(fileId, fallbackName);
           const actualName = deduplicateFilename(filename, usedNames);
-          zipEntries.push({ path: `files/${fname}/${actualName}`, data });
+          entries.push({ path: `files/${fname}/${actualName}`, data });
           await sleep(DELAY);
         } catch {
           failedFiles++;
         }
       }
 
-      zipEntries.push({ path: `json/${fname}.json`, data: jsonStr });
+      chatEntries.push(entries);
       downloaded++;
     } catch {
       // Continue with the remaining conversations.
@@ -281,7 +281,7 @@
   const memory = { memory_summary: summary, user_preferences: preferences };
 
   const failed = total - downloaded;
-  let doneMsg = `ZIP передан на страницу импорта. Бесед ${downloaded}/${total}.`;
+  let doneMsg = `Данные переданы на страницу импорта. Бесед ${downloaded}/${total}.`;
   if (failed) doneMsg += ` (${failed} failed)`;
   if (totalFiles) doneMsg += ` ${totalFiles - failedFiles}/${totalFiles} files downloaded.`;
   ui.set(`Готово к импорту. Бесед ${downloaded}/${total}.`, 100);
@@ -298,16 +298,15 @@
       return;
     }
     openImport.disabled = true;
-    ui.set("Передаю ZIP во вкладку импорта…");
+    ui.set("Передаю данные во вкладку импорта…");
     try {
-      const entries = [...zipEntries, {path: "personalization.json", data: JSON.stringify(memory)}];
-      const zipBlob = buildZipBlob(entries);
-      await transfer.send(zipBlob);
+      await transfer.send((limit) => buildArchiveBatches(chatEntries, memory, limit));
+      chatEntries.length = 0;
       openImport.remove();
       ui.done(doneMsg);
     } catch {
       transfer.cancel();
-      ui.set("Вкладка импорта не приняла ZIP. Можно повторить передачу.");
+      ui.set("Вкладка импорта не приняла данные. Можно повторить передачу.");
       openImport.disabled = false;
     }
   });
@@ -323,7 +322,7 @@
     const received = new Promise((resolve) => { markReceived = resolve; });
     const listener = (event) => {
       if (event.source !== tab || event.origin !== target.origin || event.data?.transfer !== transferId) return;
-      if (event.data.type === "chatgpt-export/ready") markReady();
+      if (event.data.type === "chatgpt-export/ready") markReady(event.data.archiveLimit);
       if (event.data.type === "chatgpt-export/received") markReceived(event.data.accepted === true);
     };
     window.addEventListener("message", listener);
@@ -344,11 +343,13 @@
       }
     };
     return {
-      async send(archive) {
+      async send(buildBatches) {
         try {
           if (tab.closed) throw new Error("Import tab was closed");
-          await wait(ready);
-          tab.postMessage({ type: "chatgpt-export/archive", transfer: transferId, format: 2, archive }, target.origin);
+          const limit = await wait(ready);
+          if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Missing archive limit");
+          const archives = buildBatches(limit);
+          tab.postMessage({ type: "chatgpt-export/archive", transfer: transferId, format: 3, archives }, target.origin);
           if (!await wait(received)) throw new Error("Import tab rejected the archive");
         } finally {
           cleanup();
@@ -365,6 +366,32 @@
   }
 
   // ── ZIP serialization ───────────────────────────────────────────────
+
+  function buildArchiveBatches(chats, memory, limit) {
+    const encoder = new TextEncoder();
+    const entrySize = ({ path, data }) => 76 + 2 * encoder.encode(path).length
+      + (typeof data === "string" ? encoder.encode(data).length : data.length);
+    const personalization = { path: "personalization.json", data: JSON.stringify(memory) };
+    const overhead = 22 + entrySize(personalization);
+    const target = Math.min(limit, 96 * 1024 * 1024);
+    const archives = [];
+    let entries = [], size = overhead, count = 0;
+    for (const chat of chats) {
+      const chatSize = chat.reduce((total, entry) => total + entrySize(entry), 0);
+      if (count && (size + chatSize > target || count >= 100 || entries.length + chat.length >= 30000)) {
+        archives.push(buildZipBlob(entries));
+        entries = [];
+        size = overhead;
+        count = 0;
+      }
+      for (const entry of chat) entries.push(entry);
+      size += chatSize;
+      count++;
+    }
+    entries.push(personalization);
+    archives.push(buildZipBlob(entries));
+    return archives;
+  }
 
   function buildZipBlob(entries) {
     if (entries.length > 0xffff) throw new Error("Too many ZIP entries");
