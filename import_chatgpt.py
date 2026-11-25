@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 import hashlib
+from html import unescape
 from http.client import HTTPException as TransportError
 import json
 import math
@@ -34,9 +35,14 @@ MARKDOWN_CODE = re.compile(
     r'|(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`)', re.M,
 )
 CHATGPT_TAG = re.compile(
-    r'<(?P<closing>/)?(?P<tag>box|row|text|badge|divider|favicon|AsyncImage|Cite|Link|FileCite)\b'
+    r'<(?P<closing>/)?(?P<tag>box|row|text|badge|divider|favicon|AsyncImageGroup|AsyncImage|Entity|Cite|Link|FileCite)\b'
     r'''(?P<attrs>(?:[^<>"']|"[^"]*"|'[^']*')*)>''', re.I,
 )
+CHATGPT_CODE_BLOCK = (
+    r'''(?i:<CodeBlock\b(?P<block_attrs>(?:[^<>"']|"[^"]*"|'[^']*')*)>'''
+    r'(?P<block_body>[\s\S]*?)</CodeBlock\s*>)'
+)
+PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.M)
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
 REFERENCE_ID = re.compile(r'\bturn\d+(?:search|view|news|file|image)\d+\b', re.I)
 CITATION_TOKEN = re.compile(r'\ue200cite[^\ue201]*\ue201')
@@ -318,10 +324,12 @@ def unix_time(value):
     return None
 
 
-def outside_code(text, transform):
+def outside_code(text, transform, convert_block=None):
     pieces, start = [], 0
-    for match in MARKDOWN_CODE.finditer(text):
-        pieces.extend((transform(text[start:match.start()]), match.group()))
+    pattern = PROTECTED_CODE if convert_block else MARKDOWN_CODE
+    for match in pattern.finditer(text):
+        code = convert_block(match) if convert_block and match['block_body'] is not None else match.group()
+        pieces.extend((transform(text[start:match.start()]), code))
         start = match.end()
     pieces.append(transform(text[start:]))
     return ''.join(pieces)
@@ -406,6 +414,16 @@ def render_chatgpt_markdown(text, source, chat, files):
     def lookup(text):
         return [web[ident.casefold()] for ident in REFERENCE_ID.findall(text) if ident.casefold() in web]
 
+    def code_block(match):
+        attrs = {key.casefold(): double or single for key, double, single in ATTR.findall(match['block_attrs'])}
+        language = attrs.get('language', '')
+        if not re.fullmatch(r'[\w.+#-]+', language):
+            language = ''
+        body = re.sub(r'^\r?\n', '', match['block_body'], count=1)
+        fence = '`' * max(3, 1 + max((len(run) for run in re.findall(r'`+', body)), default=0))
+        closing_break = '' if not body or body.endswith('\n') else '\n'
+        return f'\n\n{fence}{language}\n{body}{closing_break}{fence}\n\n'
+
     def markdown(fragment):
         if not (CHATGPT_TAG.search(fragment) or CITATION_TOKEN.search(fragment)):
             return fragment
@@ -415,8 +433,10 @@ def render_chatgpt_markdown(text, source, chat, files):
             attrs = {key.casefold(): double or single for key, double, single in ATTR.findall(match['attrs'])}
             if tag in {'box', 'row', 'text', 'divider'}:
                 return '\n\n'
-            if match['closing'] or tag in {'badge', 'favicon'}:
+            if match['closing'] or tag in {'badge', 'favicon', 'asyncimagegroup'}:
                 return ''
+            if tag == 'entity':
+                return re.sub(r'([\\`*_~\[\]<>&])', r'\\\1', unescape(attrs.get('value', '')))
             if tag == 'asyncimage':
                 return attrs.get('alt', '')
             if tag == 'filecite':
@@ -441,7 +461,9 @@ def render_chatgpt_markdown(text, source, chat, files):
         fragment = CITATION_TOKEN.sub(replace_token, fragment)
         return re.sub(r'\n[ \t]*(?:\n[ \t]*){2,}', '\n\n', fragment)
 
-    return outside_code(text, markdown).strip('\n') if CHATGPT_TAG.search(text) or CITATION_TOKEN.search(text) else text
+    if CHATGPT_TAG.search(text) or CITATION_TOKEN.search(text) or re.search(r'<CodeBlock\b', text, re.I):
+        return outside_code(text, markdown, code_block).strip('\n')
+    return text
 
 
 def image_geometry(item):
