@@ -98,11 +98,33 @@ def checked_path(name):
     return PurePosixPath(*parts)
 
 
+def read_personalization(value):
+    if not isinstance(value, dict):
+        raise ImportFailure('Неверный формат персонализации.')
+    entries, unavailable = [], []
+    for key, (path, kind) in PERSONALIZATION.items():
+        if key not in value:
+            continue
+        content = value[key]
+        if content is None:
+            unavailable.append(path)
+            continue
+        if isinstance(content, str):
+            # Older bookmarks joined the summary sections before sending them.
+            parts = re.split(r'\n\n(?=## [^\n]+\n\n)', content) if key == 'memory_summary' else [content]
+        elif key == 'memory_summary' and isinstance(content, list) and all(isinstance(part, str) for part in content):
+            parts = content
+        else:
+            raise ImportFailure('Неверный формат персонализации.')
+        entries.extend((path, kind, part.strip()) for part in parts if part.strip())
+    return entries, unavailable
+
+
 class Export:
     def __init__(self, archive, max_expanded):
         self.archive = archive
         self.entries = {}
-        self.personalization = {}
+        self.personalization = []
         self.personalization_unavailable = []
         self._register_entries(max_expanded)
 
@@ -144,16 +166,7 @@ class Export:
                 if path == PurePosixPath('personalization.json'):
                     if length > 256 * 1024:
                         raise ImportFailure('Файл персонализации превышает 256 КиБ.')
-                    value = json.load(handle)
-                    if not isinstance(value, dict) or any(
-                        key in value and value[key] is not None and not isinstance(value[key], str)
-                        for key in PERSONALIZATION
-                    ):
-                        raise ImportFailure('Неверный формат персонализации.')
-                    self.personalization = {key: value[key].strip() for key in PERSONALIZATION
-                                            if isinstance(value.get(key), str) and value[key].strip()}
-                    self.personalization_unavailable = [label for key, (label, _) in PERSONALIZATION.items()
-                                                        if key in value and value[key] is None]
+                    self.personalization, self.personalization_unavailable = read_personalization(json.load(handle))
                     continue
                 if structured:
                     if length > 128 * MIB:
@@ -1019,13 +1032,13 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
             migration.ensure('chat', marker, write_chat, prepare_files)
         existing_memories = {(item.get('path'), item.get('type'), item.get('content'))
                              for item in memories if isinstance(item, dict)}
-        for key, content in export.personalization.items():
-            path, kind = PERSONALIZATION[key]
+        for path, kind, content in export.personalization:
             if (path, kind, content) in existing_memories:
                 migration.counts['memory_unchanged'] += 1
                 continue
             item = api.post(API + '/memories/add', {'path': path, 'type': kind, 'content': content})
             if not isinstance(item, dict) or (item.get('path'), item.get('type'), item.get('content')) != (path, kind, content):
                 raise ImportFailure('Open WebUI не подтвердил добавление записи памяти.')
+            existing_memories.add((path, kind, content))
             migration.counts['memory_written'] += 1
         return {'import': dict(migration.counts), 'files_unlinked': len(assets) - len(associated)}

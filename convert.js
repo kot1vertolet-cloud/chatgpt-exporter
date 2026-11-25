@@ -124,8 +124,9 @@
       const title = typeof section.title === "string" ? section.title.trim() : "";
       sections.set(section.id, title ? `## ${title}\n\n${description}` : description);
     }
-    return [...new Set([...order, ...sections.keys()])].map((id) => sections.get(id))
-      .filter(Boolean).join("\n\n") || null;
+    const summary = [...new Set([...order, ...sections.keys()])]
+      .map((id) => sections.get(id)).filter(Boolean);
+    return summary.length ? summary : null;
   }
 
   const personalization = Promise.all([
