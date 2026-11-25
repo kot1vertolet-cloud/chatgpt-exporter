@@ -193,6 +193,16 @@
     return { filename, data: new Uint8Array(await response.arrayBuffer()) };
   }
 
+  async function retryRead(read) {
+    try {
+      return await read();
+    } catch (error) {
+      if (!(error instanceof TypeError) && !/^HTTP (429|5\d\d)$/.test(error.message)) throw error;
+      await sleep(2000);
+      return read();
+    }
+  }
+
   function attachmentPath(name, fileId, usedNames) {
     let safeName = safePathComponent(name) || "attachment";
     if (isReservedName(safeName)) safeName = `_${safeName}`;
@@ -244,6 +254,12 @@
   // ── Download conversations and files ────────────────────────────────
 
   const chatEntries = [];
+  const failures = { chats: {}, files: {} };
+  function recordFailure(group, error) {
+    const reason = /^HTTP [1-5]\d\d$/.test(error.message) ? error.message
+      : error.message === 'No download_url' ? 'ChatGPT не дал ссылку' : 'Ошибка получения данных';
+    group[reason] = (group[reason] || 0) + 1;
+  }
   let totalFiles = 0;
   let failedFiles = 0;
   const total = conversations.length;
@@ -261,7 +277,7 @@
     ui.wait(`${chat}. Получаю сообщения из ChatGPT`, pct, title);
 
     try {
-      const convo = await apiGet(`conversation/${cid}`);
+      const convo = await retryRead(() => apiGet(`conversation/${cid}`));
       const entries = [{ path: `json/${fname}.json`, data: JSON.stringify(convo) }];
 
       const usedNames = new Set();
@@ -271,19 +287,20 @@
         ui.wait(`${chat}. Скачиваю вложение ${++fileNumber} из ${files.size}`, pct, `${title} · ${fallbackName}`);
         totalFiles++;
         try {
-          const { filename, data } = await downloadFile(fileId, fallbackName);
+          const { filename, data } = await retryRead(() => downloadFile(fileId, fallbackName));
           const actualName = attachmentPath(filename, fileId, usedNames);
           entries.push({ path: `files/${fname}/${actualName}`, data });
           await sleep(DELAY);
-        } catch {
+        } catch (error) {
           failedFiles++;
+          recordFailure(failures.files, error);
         }
       }
 
       chatEntries.push(entries);
       downloaded++;
-    } catch {
-      // Continue with the remaining conversations.
+    } catch (error) {
+      recordFailure(failures.chats, error);
     }
 
     await sleep(DELAY);
@@ -317,7 +334,9 @@
     openImport.disabled = true;
     ui.wait("Ожидаю готовности вкладки импорта");
     try {
-      await transfer.send((limit) => buildArchiveBatches(chatEntries, memory, limit));
+      await transfer.send((limit) => buildArchiveBatches(chatEntries, memory, limit), {
+        chats: total, exportedChats: downloaded, files: totalFiles, downloadedFiles: totalFiles - failedFiles, failures,
+      });
       chatEntries.length = 0;
       openImport.remove();
       ui.done(doneMsg);
@@ -360,14 +379,14 @@
       }
     };
     return {
-      async send(buildBatches) {
+      async send(buildBatches, report) {
         try {
           if (tab.closed) throw new Error("Import tab was closed");
           const limit = await wait(ready);
           if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Missing archive limit");
           const archives = await buildBatches(limit);
           ui.wait("Передаю данные и ожидаю подтверждения вкладки импорта");
-          tab.postMessage({ type: "chatgpt-export/archive", transfer: transferId, format: 3, archives }, target.origin);
+          tab.postMessage({ type: "chatgpt-export/archive", transfer: transferId, format: 3, archives, report }, target.origin);
           if (!await wait(received)) throw new Error("Import tab rejected the archive");
         } finally {
           cleanup();

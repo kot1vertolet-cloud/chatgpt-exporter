@@ -73,7 +73,23 @@ const exportBookmark = document.querySelector('#export-bookmark');
 const exportSection = document.querySelector('#export-bookmark-section');
 let archives = [];
 let completed = 0;
-const totals = { counts: {}, warnings: 0, unlinked: 0, unavailable: new Set() };
+let exportReport;
+const totals = { counts: {}, warnings: {}, unlinked: 0, unavailable: new Set() };
+const warningLabels = {
+  project_without_id: 'Проект без ID',
+  unresolved_project_membership: 'Чат проекта не найден',
+  ambiguous_project_membership: 'Чат относится к нескольким проектам',
+  ambiguous_attachment: 'Неоднозначная ссылка на вложение',
+  missing_attachment: 'Вложение не найдено в выгрузке',
+  missing_generated_image: 'Сгенерированное изображение не найдено',
+  conversation_without_visible_messages: 'Пропущен чат без видимых сообщений',
+  missing_parent_node: 'Не найдено родительское сообщение',
+  active_branch_inferred: 'Активная ветка определена автоматически',
+};
+
+function describeCounts(counts, labels = {}) {
+  return Object.entries(counts || {}).map(([key, count]) => `${labels[key] || key}: ${count}`).join('; ');
+}
 
 exportBookmark.addEventListener('click', (event) => {
   event.preventDefault();
@@ -116,6 +132,7 @@ if (transferId && /^[a-f0-9-]{36}$/.test(transferId)) {
         && batches.every((archive) => archive instanceof Blob && archive.size > 0);
       if (accepted) {
         archives = batches;
+        exportReport = event.data.report;
         form.hidden = false;
         status.textContent = 'Данные из ChatGPT получены. Нажмите «Импортировать».';
         history.replaceState(null, '', location.pathname);
@@ -195,18 +212,32 @@ form.addEventListener('submit', async (event) => {
       for (const [name, count] of Object.entries(data.import)) {
         totals.counts[name] = (totals.counts[name] || 0) + count;
       }
-      totals.warnings += Object.values(data.warnings).reduce((sum, count) => sum + count, 0);
+      for (const [name, count] of Object.entries(data.warnings)) {
+        totals.warnings[name] = (totals.warnings[name] || 0) + count;
+      }
       totals.unlinked += data.files_unlinked;
       for (const section of data.personalization_unavailable) totals.unavailable.add(section);
       archives.shift();
       completed++;
     }
     const counts = totals.counts;
-    status.textContent = `Добавлено чатов: ${counts.conversation_written || 0}. `
+    status.textContent = '';
+    if (exportReport) {
+      status.textContent += `Из ChatGPT выгружено чатов: ${exportReport.exportedChats} из ${exportReport.chats}. `
+        + `Скачано вложений: ${exportReport.downloadedFiles} из ${exportReport.files}. `;
+      for (const [key, label] of [['chats', 'Сбои выгрузки чатов'], ['files', 'Сбои загрузки вложений']]) {
+        const reasons = describeCounts(exportReport.failures?.[key]);
+        if (reasons) status.textContent += `${label}: ${reasons}. `;
+      }
+    }
+    status.textContent += `Добавлено чатов: ${counts.conversation_written || 0}. `
       + `Уже в истории: ${counts.conversation_unchanged || 0}. `
       + `Пропущено изменённых бесед: ${counts.conversation_changed || 0}. `
       + `Записей памяти добавлено: ${counts.memory_written || 0}. Уже в памяти: ${counts.memory_unchanged || 0}. `
-      + `Файлов без связи с сообщениями: ${totals.unlinked}. Предупреждений: ${totals.warnings}.`;
+      + `Новых файлов: ${counts.attachment_written || 0}. Повторно использовано файлов: ${counts.attachment_unchanged || 0}. `
+      + `Файлов без связи с сообщениями: ${totals.unlinked}.`;
+    const warnings = describeCounts(totals.warnings, warningLabels);
+    if (warnings) status.textContent += ` Предупреждения: ${warnings}.`;
     if (totals.unavailable.size) {
       status.textContent += ` ChatGPT не вернул следующие разделы: ${[...totals.unavailable].join(', ')}.`;
     }
