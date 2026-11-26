@@ -44,6 +44,16 @@ CHATGPT_CODE_BLOCK = (
     r'(?P<block_body>[\s\S]*?)</CodeBlock\s*>)'
 )
 PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.M)
+DIL_TAGS = r'form|label|radio-group|radio|slider|button|grid-item|grid|caption|icon|checkbox|chart|table-row|table-cell|table|box'
+DIL_MARKUP = re.compile(r'\{@body\b|\{#each\b|</?(?:form|grid(?:-item)?|chart|slider|table|button|checkbox|radio-group|caption)(?=[\s/>])', re.I)
+DIL_TOKEN = re.compile(
+    PROTECTED_CODE.pattern + r'|(?P<dil_tag><(?P<dil_close>/)?(?P<dil_name>(?i:' + DIL_TAGS
+    + r'))(?=[\s/>]))|(?P<dil_expression>\{(?=@body\b|#each\b|/each\b|[a-zA-Z_]))', re.M,
+)
+DIL_DELIMITER = re.compile(r'''(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\x60(?:\\[\s\S]|[^\x60\\])*\x60)|[{}>]''')
+DIL_JSON_KEYS = re.compile(r'"(?:\\.|[^"\\])*"|(?P<key>[A-Za-z_]\w*)(?=\s*:)')
+DIL_PATH = r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*'
+DIL_STATE = re.compile(r'const\s+(?:\[\s*([A-Za-z_]\w*)\s*,\s*[A-Za-z_]\w*\s*\]\s*=\s*DIL\.useState\((.*)\)|([A-Za-z_]\w*)\s*=\s*(.*))\s*;?', re.S)
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
 WIDGET_QUERY = re.compile(r'''\bquery\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])\s*\})''')
 WIDGET_TAGS = {'asyncimage', 'asyncimagegroup'}
@@ -568,7 +578,175 @@ def bind_widget_images(text, records, assets, conversation, node, diagnostics):
     return bound
 
 
+def dil_end(text, start, expression):
+    depth = int(expression)
+    for match in DIL_DELIMITER.finditer(text, start):
+        token = match.group()
+        if token == '{':
+            depth += 1
+        elif token == '}':
+            depth -= 1
+            if expression and not depth:
+                return match.end()
+        elif token == '>' and not expression and not depth:
+            return match.end()
+    return None
+
+
+def dil_json(literal):
+    try:
+        return json.loads(DIL_JSON_KEYS.sub(lambda match: json.dumps(match['key'])
+                                           if match['key'] else match.group(), literal))
+    except (ValueError, RecursionError):
+        return None
+
+
+def dil_value(expression, scope):
+    conditional = re.fullmatch(rf'({DIL_PATH})\s*\?\s*("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")', expression)
+    path = conditional[1] if conditional else expression
+    if not re.fullmatch(DIL_PATH, path):
+        return None
+    root, *fields = path.split('.')
+    value = scope.get(root)
+    for field in fields:
+        if isinstance(value, dict):
+            value = value.get(field)
+        elif field == 'length' and isinstance(value, (list, str)):
+            value = len(value)
+        else:
+            return None
+    if conditional and value is not None:
+        return dil_json(conditional[2] if value else conditional[3])
+    return value if isinstance(value, (str, int, float)) else None
+
+
+def dil_table(headers, rows):
+    def row(values):
+        return '| ' + ' | '.join(' '.join(str(value).split()).replace('|', r'\|') for value in values) + ' |'
+
+    return '\n\n' + '\n'.join([row(headers), row(['---'] * len(headers)), *(row(values) for values in rows)]) + '\n\n'
+
+
+def dil_chart(attrs):
+    start = re.search(r'\bcontent\s*=\s*\{', attrs)
+    end = dil_end(attrs, start.end(), True) if start else None
+    data = dil_json(attrs[start.end():end - 1]) if end else None
+    if not isinstance(data, dict):
+        return ''
+    meta = data.get('meta') if isinstance(data.get('meta'), dict) else {}
+    summary = '\n\n'.join(str(meta[key]) for key in ('title', 'description') if meta.get(key))
+    x = data.get('xKey')
+    candidates = data.get('series')
+    series = [item for item in (candidates if isinstance(candidates, list) else [])
+              if isinstance(item, dict) and isinstance(item.get('dataKey'), str)]
+    if not isinstance(x, str) or not series or not isinstance(data.get('data'), list):
+        return f'\n\n{summary}\n\n' if summary else ''
+    headers = [x, *(series_item.get('label') or series_item['dataKey'] for series_item in series)]
+    rows = [[item.get(x, ''), *(f"{item.get(series_item['dataKey'], '')}{series_item.get('valueSuffix') or ''}"
+                               for series_item in series)] for item in data['data'] if isinstance(item, dict)]
+    return f'\n\n{summary}' + dil_table(headers, rows)
+
+
+def dil_loop_end(text, start):
+    depth, position = 1, start
+    while match := DIL_TOKEN.search(text, position):
+        position = match.end()
+        if match['dil_tag'] or match['dil_expression']:
+            end = dil_end(text, position, bool(match['dil_expression']))
+            if not end:
+                continue
+            position = end
+            if match['dil_expression']:
+                expression = text[match.end():end - 1]
+                if expression.startswith('#each'):
+                    depth += 1
+                elif expression.startswith('/each'):
+                    depth -= 1
+                    if not depth:
+                        return match.start(), end
+    return None
+
+
+def render_dil_markup(text, scope=None, depth=0, budget=None):
+    if not DIL_MARKUP.search(text) and scope is None:
+        return text
+    scope = {} if scope is None else scope.copy()
+    budget = [1000] if budget is None else budget
+    result = []
+    position = 0
+    while match := DIL_TOKEN.search(text, position):
+        before = text[position:match.start()]
+        position = match.end()
+        expression = bool(match['dil_expression'])
+        if not (expression or match['dil_tag']):
+            result.extend((before, match.group()))
+            continue
+        end = dil_end(text, position, expression)
+        if end is None:
+            result.extend((before, match.group()))
+            continue
+        value = text[position:end - 1].strip()
+        position = end
+        if expression and value.startswith('@body'):
+            result.append(re.sub(r'(?m)^[ \t]*#{1,6}[ \t]*$', '', before))
+            declaration = DIL_STATE.fullmatch(value[5:].strip().rstrip(';'))
+            if declaration:
+                name = declaration[1] or declaration[3]
+                scope[name] = dil_json(declaration[2] if declaration[1] else declaration[4])
+            continue
+        result.append(before)
+        if expression:
+            if value.startswith('#each'):
+                loop = dil_loop_end(text, end)
+                if loop:
+                    body_end, position = loop
+                    clause = re.fullmatch(r'#each\s+(.+)\s+as\s+([A-Za-z_]\w*)', value, re.S)
+                    if clause and depth < 4:
+                        literal, name = clause.groups()
+                        items = scope.get(literal.strip()) if re.fullmatch(DIL_PATH, literal.strip()) else dil_json(literal)
+                        if isinstance(items, list):
+                            for item in items[:100]:
+                                if not budget[0]:
+                                    break
+                                budget[0] -= 1
+                                result.append(render_dil_markup(text[end:body_end], {**scope, name: item}, depth + 1, budget))
+                    continue
+            rendered = dil_value(value, scope)
+            result.append(str(rendered) if rendered is not None else text[match.start():end])
+            continue
+
+        tag = match['dil_name'].casefold()
+        closing = bool(match['dil_close'])
+        if tag == 'chart' and not closing:
+            result.append(dil_chart(value))
+        elif tag == 'table' and not closing:
+            table_end = re.search(r'</table\s*>', text[end:], re.I)
+            if table_end:
+                table = text[end:end + table_end.start()]
+                position = end + table_end.end()
+                rows = [[render_dil_markup(cell, scope, depth) for cell in re.findall(
+                    r'<table-cell\b[^>]*>(.*?)</table-cell\s*>', row, re.I | re.S)]
+                    for row in re.findall(r'<table-row\b[^>]*>(.*?)</table-row\s*>', table, re.I | re.S)]
+                width = max(map(len, rows), default=0)
+                if width:
+                    result.append(dil_table([f'Столбец {index}' for index in range(1, width + 1)],
+                                            [row + [''] * (width - len(row)) for row in rows]))
+        elif tag == 'label':
+            result.append('**\n\n' if closing else '\n\n**')
+        elif tag in {'checkbox', 'radio'}:
+            result.append('\n' if closing else '\n- [ ] ' if tag == 'checkbox' else '\n- ')
+        elif tag == 'slider' and not closing:
+            bounds = dict(re.findall(r'\b(min|max|step)\s*=\s*\{\s*(-?\d+(?:\.\d+)?)\s*\}', value))
+            if 'min' in bounds and 'max' in bounds:
+                step = f", шаг {bounds['step']}" if 'step' in bounds else ''
+                result.append(f"\n\nДиапазон {bounds['min']}–{bounds['max']}{step}.\n\n")
+        elif tag not in {'icon', 'box'}:
+            result.append('\n\n')
+    return ''.join(result) + text[position:]
+
+
 def render_chatgpt_markdown(text, source, chat, files):
+    text = render_dil_markup(text)
     web = chat['web_references']
     documents = chat['document_references']
     citations = {}
@@ -602,7 +780,7 @@ def render_chatgpt_markdown(text, source, chat, files):
             if tag == 'title':
                 if match['closing'] or match['attrs'].rstrip().endswith('/'):
                     return '\n\n'
-                heading = {'lg': '##', 'md': '###', 'sm': '####'}.get(attrs.get('size'), '###')
+                heading = {'xl': '##', 'lg': '##', 'md': '###', 'sm': '####'}.get(attrs.get('size'), '###')
                 return f'\n\n{heading} '
             if tag in {'box', 'row', 'text', 'divider'}:
                 return '\n\n'
