@@ -36,7 +36,7 @@ MARKDOWN_CODE = re.compile(
     r'|(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`)', re.M,
 )
 CHATGPT_TAG = re.compile(
-    r'<(?P<closing>/)?(?P<tag>box|row|text|badge|divider|favicon|AsyncImageGroup|AsyncImage|Entity|Cite|Link|FileCite)\b'
+    r'<(?P<closing>/)?(?P<tag>box|row|text|title(?=[\s/>])|badge|divider|favicon|AsyncImageGroup|AsyncImage|Entity|Cite|Link|FileCite)\b'
     r'''(?P<attrs>(?:[^<>"']|"[^"]*"|'[^']*')*)>''', re.I,
 )
 CHATGPT_CODE_BLOCK = (
@@ -599,6 +599,11 @@ def render_chatgpt_markdown(text, source, chat, files):
         def replace_tag(match):
             tag = match['tag'].casefold()
             attrs = {key.casefold(): double or single for key, double, single in ATTR.findall(match['attrs'])}
+            if tag == 'title':
+                if match['closing'] or match['attrs'].rstrip().endswith('/'):
+                    return '\n\n'
+                heading = {'lg': '##', 'md': '###', 'sm': '####'}.get(attrs.get('size'), '###')
+                return f'\n\n{heading} '
             if tag in {'box', 'row', 'text', 'divider'}:
                 return '\n\n'
             if match['closing'] or tag in {'badge', 'favicon'}:
