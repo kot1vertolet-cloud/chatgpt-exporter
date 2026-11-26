@@ -199,15 +199,21 @@
     return references;
   }
 
-  async function downloadFile(fileId, fallbackName, updateStage) {
+  async function downloadFile(fileId, fallbackName, conversationId, projectId, updateStage) {
     updateStage('Запрос ссылки на вложение');
-    const meta = await apiGet(`files/download/${fileId}`);
+    // ChatGPT's download route uses asterisks as separators in compound file IDs.
+    const route = `files/download/${encodeURIComponent(fileId.replaceAll('#', '*'))}`;
+    const compound = fileId.includes('#');
+    const query = new URLSearchParams({ conversation_id: conversationId });
+    if (projectId) query.set('gizmo_id', projectId);
+    const meta = compound ? await apiGet(`${route}?${query}`, { headers: personalizationHeaders }) : await apiGet(route);
     if (!meta.download_url) throw new Error("No download_url");
     updateStage('Скачивание вложения');
     const response = await fetch(meta.download_url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const contentType = response.headers.get("content-type") || "";
-    let filename = meta.file_name || fallbackName || fileId;
+    const partName = compound ? fileId.slice(fileId.lastIndexOf('#') + 1) : '';
+    let filename = /\.[a-z0-9]{1,10}$/i.test(partName) ? partName : meta.file_name || fallbackName || fileId;
     // Add extension from content-type if missing
     if (!filename.includes(".") && contentType) {
       const mime = contentType.split(";")[0].trim();
@@ -232,11 +238,11 @@
     if (isReservedName(safeName)) safeName = `_${safeName}`;
     const key = Array.from(safeName.normalize("NFC"), (char) => char.toUpperCase().toLowerCase())
       .join("").replace(/ß/g, "ss");
-    if (safeName === name && !usedNames.has(key)) {
+    if (!fileId.includes('#') && safeName === name && !usedNames.has(key)) {
       usedNames.add(key);
       return safeName;
     }
-    // Keep the source ID available when the original filename cannot be used in the ZIP.
+    // Preserve the source ID for compound files and files with renamed ZIP entries.
     const encodedId = Array.from(new TextEncoder().encode(fileId), (byte) => byte.toString(16).padStart(2, "0")).join("");
     return `id-${encodedId}/${safeName}`;
   }
@@ -353,6 +359,7 @@
       const projectIds = memberships.get(cid) || new Set();
       const declaredProject = convo.project_id || convo.gizmo_id;
       if (projects.has(declaredProject)) projectIds.add(declaredProject);
+      const projectId = declaredProject || (projectIds.size === 1 ? projectIds.values().next().value : undefined);
       if (projectIds.size) {
         const records = [...projectIds].map((id) => ({ ...projects.get(id), conversation_ids: [convo.conversation_id || convo.id || cid] }));
         entries.push({ path: `projects.${i}.json`, data: JSON.stringify(records) });
@@ -366,7 +373,7 @@
         totalFiles++;
         let stage;
         try {
-          const { filename, data } = await retryRead(() => downloadFile(fileId, fallbackName, (value) => { stage = value; }));
+          const { filename, data } = await retryRead(() => downloadFile(fileId, fallbackName, cid, projectId, (value) => { stage = value; }));
           stage = 'Упаковка вложения';
           const actualName = attachmentPath(filename, fileId, usedNames);
           entries.push({ path: `files/${fname}/${actualName}`, data });
