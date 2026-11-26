@@ -20,7 +20,7 @@ import zipfile
 
 from import_chatgpt import (
     API, MIB, Export, ImportFailure, RequestFailure, UnconfirmedWrite, WebUI,
-    apply_import, convert, remote_id,
+    apply_import, convert, markdown_link, remote_id,
 )
 
 
@@ -80,6 +80,7 @@ let exportReport;
 let reportId;
 let reportPending = false;
 const importEvents = [];
+const journalFiles = new Map();
 const totals = { counts: {}, warnings: {}, unlinked: 0, unavailable: new Set() };
 const warningLabels = {
   project_without_id: 'Проект без ID',
@@ -200,7 +201,7 @@ async function saveJournal(state, total) {
   }
   const response = await fetch('/chatgpt-import/journal', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({run: transferId, id: reportId, text: lines.join('\\n')}),
+    body: JSON.stringify({run: transferId, id: reportId, text: lines.join('\\n'), files: [...journalFiles.values()]}),
   });
   const data = await response.json().catch(() => null);
   if (!response.ok || !data?.id) throw new Error('Open WebUI не сохранил журнал миграции');
@@ -243,6 +244,7 @@ form.addEventListener('submit', async (event) => {
       }
       const {data} = response;
       for (const detail of data?.diagnostics || []) importEvents.push(detail);
+      for (const {id, name} of data?.journal_files || []) journalFiles.set(`${id}/${name}`, {id, name});
       if (!response.ok || !data?.import) {
         importEvents.push({ stage: `Импорт части ${completed + 1}`, reason: data?.error || `HTTP ${response.status}` });
         await saveJournal('Импорт прерван', total);
@@ -427,6 +429,18 @@ class BrowserImport(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text.strip():
             raise UploadError(400, 'Журнал пуст.')
         content = '\n'.join('    ' + line for line in text.splitlines())
+        files = payload.get('files', [])
+        if not isinstance(files, list):
+            raise UploadError(400, 'Некорректный список файлов журнала.')
+        links = []
+        for file in files:
+            ident = str(UUID(file['id']))
+            name = file['name']
+            if not isinstance(name, str) or not name.strip():
+                raise UploadError(400, 'Некорректное имя файла журнала.')
+            links.append('- ' + markdown_link(name, f'{API}/files/{ident}/content?attachment=true'))
+        if links:
+            content += '\n\n## Файлы без привязки к сообщению\n\n' + '\n'.join(links)
         chat_id = payload.get('id')
         if not chat_id:
             # A retry after a lost response must find the journal created by the first request.

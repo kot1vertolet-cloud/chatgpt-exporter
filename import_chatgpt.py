@@ -44,6 +44,8 @@ CHATGPT_CODE_BLOCK = (
 )
 PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.M)
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
+WIDGET_QUERY = re.compile(r'''\bquery\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])\s*\})''')
+WIDGET_TAGS = {'asyncimage', 'asyncimagegroup'}
 REFERENCE_ID = re.compile(r'\bturn\d+(?:search|view|news|file|image)\d+\b', re.I)
 CITATION_TOKEN = re.compile(r'\ue200cite[^\ue201]*\ue201')
 DOCUMENT_REFERENCE = re.compile(
@@ -408,10 +410,59 @@ def source_links(sources):
     return ', '.join(markdown_link(title, url) for url, title in unique.items())
 
 
+def widget_key(component, query):
+    if isinstance(query, str):
+        return component.casefold(), (query,)
+    if isinstance(query, list) and all(isinstance(value, str) for value in query):
+        return component.casefold(), tuple(query)
+    return None
+
+
+def widget_tag_key(match):
+    query = WIDGET_QUERY.search(match['attrs'])
+    if query is None:
+        return None
+    double, single, literal = query.groups()
+    try:
+        value = json.loads(literal) if literal is not None else unescape(double if double is not None else single)
+    except ValueError:
+        return None
+    return widget_key(match['tag'], value)
+
+
+def bind_widget_images(text, records, assets, conversation, node, diagnostics):
+    if 'asyncimage' not in text.casefold():
+        return {}
+    matches = Counter()
+
+    def count_widgets(fragment):
+        matches.update(widget_tag_key(match) for match in CHATGPT_TAG.finditer(fragment)
+                       if not match['closing'] and match['tag'].casefold() in WIDGET_TAGS)
+        return ''
+
+    outside_code(text, count_widgets, lambda match: match.group())
+    candidates = defaultdict(list)
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict) or not isinstance(record.get('component'), str):
+            continue
+        key = widget_key(record['component'], record.get('query'))
+        if key not in matches or key is None or not isinstance(record.get('paths'), list):
+            continue
+        candidates[key].append([assets.paths[path_key(value)] for value in record['paths']
+                                if isinstance(value, str) and path_key(value) in assets.paths])
+    bound = {key: images for key, images in candidates.items() if len(images) == matches[key]}
+    missing = sum(matches.values()) - sum(bool(paths) for images in bound.values() for paths in images)
+    if missing:
+        diagnostics.append({'stage': 'Перенос иллюстраций ответа', 'chat': conversation, 'message': node,
+                            'reason': f'Иллюстрации без доступного однозначно связанного файла: {missing}'})
+    return bound
+
+
 def render_chatgpt_markdown(text, source, chat, files):
     web = chat['web_references']
     documents = chat['document_references']
     citations = {}
+    widget_images = {key: iter(images) for key, images in source.get('widget_images', {}).items()}
     for ref in source['content_references']:
         matched = ref.get('matched_text')
         if isinstance(matched, str) and CITATION_TOKEN.fullmatch(matched):
@@ -440,12 +491,16 @@ def render_chatgpt_markdown(text, source, chat, files):
             attrs = {key.casefold(): double or single for key, double, single in ATTR.findall(match['attrs'])}
             if tag in {'box', 'row', 'text', 'divider'}:
                 return '\n\n'
-            if match['closing'] or tag in {'badge', 'favicon', 'asyncimagegroup'}:
+            if match['closing'] or tag in {'badge', 'favicon'}:
                 return ''
             if tag == 'entity':
                 return re.sub(r'([\\`*_~\[\]<>&])', r'\\\1', unescape(attrs.get('value', '')))
-            if tag == 'asyncimage':
-                return attrs.get('alt', '')
+            if tag in WIDGET_TAGS:
+                paths = next(widget_images.get(widget_tag_key(match), iter(())), ())
+                if paths:
+                    images = '\n\n'.join('!' + markdown_link(files[path]['name'], files[path]['url']) for path in paths)
+                    return f'\n\n{images}\n\n'
+                return attrs.get('alt', '') if tag == 'asyncimage' else ''
             if tag == 'filecite':
                 path = documents.get(attrs.get('ref_id', '').casefold())
                 if path in files:
@@ -574,6 +629,7 @@ def convert(conversations, projects, assets, warnings, diagnostics):
     output = []
     for cid, row in conversations.items():
         mapping = row['mapping']
+        resolved_widgets = row.get('chatgpt_import_images') or {}
         if any(not isinstance(node, dict) for node in mapping.values()):
             diagnostics.append({'stage': 'Разбор чата', 'chat': cid, 'reason': 'Некорректный узел в истории'})
             raise ImportFailure('Invalid node in conversation mapping')
@@ -585,6 +641,9 @@ def convert(conversations, projects, assets, warnings, diagnostics):
                 continue
             converted = visible_message(message, index, cid) or generated_image_message(message, index, cid)
             if converted:
+                if converted['role'] == 'assistant':
+                    records = resolved_widgets.get(nid) if isinstance(resolved_widgets, dict) else None
+                    converted['widget_images'] = bind_widget_images(converted['content'], records, index, cid, nid, diagnostics)
                 visible[nid] = converted
         if not visible:
             warnings['conversation_without_visible_messages'] += 1
@@ -632,6 +691,8 @@ def convert(conversations, projects, assets, warnings, diagnostics):
             warnings['active_branch_inferred'] += 1
         project = memberships.get(cid)
         attached_paths = {path for message in visible.values() for path in message['attachments']}
+        attached_paths.update(path for message in visible.values() for images in message.get('widget_images', {}).values()
+                              for paths in images for path in paths)
         source_messages = [node['message'] for node in mapping.values() if isinstance(node.get('message'), dict)]
         signature = digest([row, project, {str(p): assets[p]['sha256'] for p in attached_paths}])
         output.append({
@@ -1014,15 +1075,14 @@ def server_preflight(api, user, upload_limit, upload_sizes, need_folders):
     limit = min(upload_limit, int(configured) * MIB) if configured else upload_limit
     if any(size > limit for size in upload_sizes):
         raise ImportFailure(f'An upload exceeds the effective {limit // MIB} MiB limit')
+    return limit
 
 
 def apply_import(api, user, export, chats, projects, assets, *, upload_limit, journal_path, diagnostics):
     associated = {path for chat in chats for path in chat['assets']}
-    for path in sorted(assets.keys() - associated):
-        diagnostics.append({'stage': 'Привязка вложения', 'file': assets[path]['sha256'],
-                            'reason': 'Файл получен, связь с видимым сообщением не установлена'})
-    server_preflight(api, user, upload_limit, (assets[path]['size'] for path in associated), bool(projects))
-    attachment_sizes = {assets[path]['sha256']: assets[path]['size'] for path in associated}
+    unlinked = assets.keys() - associated
+    limit = server_preflight(api, user, upload_limit, (assets[path]['size'] for path in associated), bool(projects))
+    attachment_sizes = {item['sha256']: item['size'] for item in assets.values()}
 
     with journal(journal_path) as database:
         migration = Migration(api, user['id'], database, attachment_sizes)
@@ -1058,6 +1118,14 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
             occupied_names.add(path_key(name))
 
         references = {}
+
+        def upload_file(path):
+            info = assets[path]
+            mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+            with export.read(path) as handle:
+                ident = migration.file(handle, path.name, mime, info['size'], info['sha256'])
+            return file_reference(ident, path.name, mime, info['size'])
+
         for chat in chats:
             marker = marker_for('conversation', chat['id'], chat['fingerprint'])
 
@@ -1065,15 +1133,12 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
                 for path in sorted(chat['assets']):
                     if path not in references:
                         info = assets[path]
-                        mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
                         try:
-                            with export.read(path) as handle:
-                                ident = migration.file(handle, path.name, mime, info['size'], info['sha256'])
+                            references[path] = upload_file(path)
                         except ImportFailure as error:
                             diagnostics.append({'stage': 'Импорт вложения', 'chat': chat['id'],
                                                 'file': info['sha256'], 'reason': str(error)})
                             raise
-                        references[path] = file_reference(ident, path.name, mime, info['size'])
 
             def write_chat():
                 payload = chat_payload(chat, user['id'], references, marker, folder_ids.get(chat['project']))
@@ -1103,4 +1168,15 @@ def apply_import(api, user, export, chats, projects, assets, *, upload_limit, jo
                 raise
             existing_memories.add((path, kind, content))
             migration.counts['memory_written'] += 1
-        return {'import': dict(migration.counts), 'files_unlinked': len(assets) - len(associated)}
+        journal_files = []
+        for path in sorted(unlinked):
+            try:
+                if assets[path]['size'] > limit:
+                    raise ImportFailure(f'Файл превышает лимит {limit // MIB} МиБ')
+                journal_files.append(upload_file(path))
+            except ImportFailure as error:
+                reason = f'Связь с сообщением не установлена. Файл не удалось сохранить в журнале: {error}'
+            else:
+                reason = 'Связь с видимым сообщением не установлена. Файл доступен в журнале'
+            diagnostics.append({'stage': 'Привязка вложения', 'file': assets[path]['sha256'], 'reason': reason})
+        return {'import': dict(migration.counts), 'files_unlinked': len(unlinked), 'journal_files': journal_files}

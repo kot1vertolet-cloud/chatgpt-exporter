@@ -27,6 +27,8 @@
     if (/^HTTP [1-5]\d\d$/.test(error.message)) return error.message;
     if (error.name === 'TimeoutError') return 'Истекло время ожидания ответа ChatGPT';
     if (error.message === 'No download_url') return 'ChatGPT не дал ссылку на скачивание';
+    if (error.message === 'Unsupported image source') return 'Адрес иллюстрации вне разрешённого домена OpenAI';
+    if (error.message === 'Unsupported image type') return 'OpenAI вернул неподдерживаемый формат иллюстрации';
     if (error instanceof TypeError) return 'Сетевой сбой при получении данных';
     if (error instanceof SyntaxError) return 'Некорректный ответ ChatGPT';
     return 'Не удалось обработать полученные данные';
@@ -233,6 +235,47 @@
     }
   }
 
+  function resolvedImageWidgets(convo) {
+    const widgets = [];
+    const invocations = /__dil\.jsx\((AsyncImage(?:Group)?),\{((?:[^{}"]|"(?:\\.|[^"\\])*")*?)"__resolutionId"\s*:\s*__dilConstants\["([^"\\]+)"\]/g;
+    const queryLiteral = /"query"\s*:\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])/;
+    for (const [nodeId, node] of Object.entries(convo.mapping || {})) {
+      const message = node?.message;
+      const model = message?.metadata?.model_dil_v2;
+      if (message?.author?.role !== 'assistant' || typeof model?.code !== 'string') continue;
+      const results = model.appData?.opGenui?.componentResults;
+      for (const [, component, props, key] of model.code.matchAll(invocations)) {
+        const literal = queryLiteral.exec(props)?.[1];
+        if (!literal) continue;
+        const id = model.constants?.[key];
+        const result = results?.[id];
+        if (result?.componentName !== component || result.status !== 'resolved' || !Array.isArray(result.state?.images)) continue;
+        let query;
+        try { query = JSON.parse(literal); } catch { continue; }
+        if (typeof query !== 'string' && !(Array.isArray(query) && query.every((value) => typeof value === 'string'))) continue;
+        const urls = result.state.images.slice(0, component === 'AsyncImage' ? 1 : undefined)
+          .map((item) => item?.content_url || item?.thumbnail_url).filter((url) => typeof url === 'string');
+        widgets.push({ nodeId, component, query, urls });
+      }
+    }
+    return widgets;
+  }
+
+  async function downloadWidgetImage(value) {
+    const url = new URL(value);
+    if (url.origin !== 'https://images.openai.com' || url.username || url.password) {
+      throw new Error('Unsupported image source');
+    }
+    const response = await fetch(url, { credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer',
+      signal: AbortSignal.timeout(30000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const type = response.headers.get('content-type')?.split(';', 1)[0].trim();
+    const extension = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+      'image/webp': '.webp', 'image/avif': '.avif' }[type];
+    if (!extension) throw new Error('Unsupported image type');
+    return { data: new Uint8Array(await response.arrayBuffer()), extension };
+  }
+
   function attachmentPath(name, fileId, usedNames) {
     let safeName = safePathComponent(name) || "attachment";
     if (isReservedName(safeName)) safeName = `_${safeName}`;
@@ -355,7 +398,7 @@
 
     try {
       const convo = await retryRead(() => apiGet(`conversation/${cid}`));
-      const entries = [{ path: `json/${fname}.json`, data: JSON.stringify(convo) }];
+      const entries = [];
       const projectIds = memberships.get(cid) || new Set();
       const declaredProject = convo.project_id || convo.gizmo_id;
       if (projects.has(declaredProject)) projectIds.add(declaredProject);
@@ -383,6 +426,34 @@
           recordFailure(failures.files, error, { stage, chat: cid, file: fileId });
         }
       }
+
+      const widgets = resolvedImageWidgets(convo);
+      if (widgets.length) {
+        const resolved = {};
+        let imageNumber = 0;
+        for (const { nodeId, component, query, urls } of widgets) {
+          const paths = [];
+          for (const url of urls) {
+            ui.wait(`${chat}. Скачиваю иллюстрацию ответа ${++imageNumber}`, pct, title);
+            totalFiles++;
+            try {
+              const {data, extension} = await retryRead(() => downloadWidgetImage(url));
+              const path = `files/${fname}/widgets/image-${imageNumber}${extension}`;
+              entries.push({ path, data });
+              paths.push(path);
+            } catch (error) {
+              failedFiles++;
+              recordFailure(failures.files, error, { stage: 'Скачивание иллюстрации ответа', chat: cid, message: nodeId,
+                file: String(imageNumber) });
+            }
+          }
+          (resolved[nodeId] ||= []).push({ component, query, paths });
+        }
+        if (Object.values(resolved).some((records) => records.some(({paths}) => paths.length))) {
+          convo.chatgpt_import_images = resolved;
+        }
+      }
+      entries.push({ path: `json/${fname}.json`, data: JSON.stringify(convo) });
 
       chatEntries.push(entries);
       for (const id of projectIds) assignedProjects.add(id);
