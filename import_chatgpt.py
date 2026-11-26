@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import hashlib
 from html import unescape
 from http.client import HTTPException as TransportError
+from io import BytesIO
 import json
 import math
 import mimetypes
@@ -46,6 +47,14 @@ PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
 WIDGET_QUERY = re.compile(r'''\bquery\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])\s*\})''')
 WIDGET_TAGS = {'asyncimage', 'asyncimagegroup'}
+WIDGET_INVOCATION = re.compile(
+    r'__dil\.jsx\((AsyncImage(?:Group)?),\{((?:[^{}"]|"(?:\\.|[^"\\])*")*?)'
+    r'"__resolutionId"\s*:\s*__dilConstants\["([^"\\]+)"\]',
+)
+WIDGET_QUERY_LITERAL = re.compile(r'"query"\s*:\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])')
+WIDGET_IMAGE_EXTENSIONS = {
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp', 'image/avif': '.avif',
+}
 REFERENCE_ID = re.compile(r'\bturn\d+(?:search|view|news|file|image)\d+\b', re.I)
 CITATION_TOKEN = re.compile(r'\ue200cite[^\ue201]*\ue201')
 DOCUMENT_REFERENCE = re.compile(
@@ -132,6 +141,7 @@ class Export:
     def __init__(self, archive, max_expanded):
         self.archive = archive
         self.entries = {}
+        self.additional_files = {}
         self.personalization = []
         self.personalization_unavailable = []
         self._register_entries(max_expanded)
@@ -157,8 +167,11 @@ class Export:
         for key in seen:
             if any(seen.get(parent.as_posix()) is False for parent in PurePosixPath(key).parents):
                 raise ImportFailure('File and directory paths collide in export')
+        self.image_budget = max_expanded - size
 
     def read(self, path):
+        if path in self.additional_files:
+            return BytesIO(self.additional_files[path])
         return self.archive.open(self.entries[path])
 
     def inventory(self):
@@ -430,17 +443,113 @@ def widget_tag_key(match):
     return widget_key(match['tag'], value)
 
 
-def bind_widget_images(text, records, assets, conversation, node, diagnostics):
-    if 'asyncimage' not in text.casefold():
-        return {}
+def count_image_widgets(text):
     matches = Counter()
+    if 'asyncimage' in text.casefold():
+        def count_fragment(fragment):
+            matches.update(widget_tag_key(match) for match in CHATGPT_TAG.finditer(fragment)
+                           if not match['closing'] and match['tag'].casefold() in WIDGET_TAGS)
+            return ''
 
-    def count_widgets(fragment):
-        matches.update(widget_tag_key(match) for match in CHATGPT_TAG.finditer(fragment)
-                       if not match['closing'] and match['tag'].casefold() in WIDGET_TAGS)
-        return ''
+        outside_code(text, count_fragment, lambda match: match.group())
+    return matches
 
-    outside_code(text, count_widgets, lambda match: match.group())
+
+def download_widget_image(opener, value, limit):
+    url = urlsplit(value)
+    if (url.scheme != 'https' or url.netloc != 'images.openai.com' or url.fragment
+            or not re.fullmatch(r'/static-rsc-\d+/[A-Za-z0-9_-]+', url.path)):
+        raise ImportFailure('Адрес иллюстрации вне разрешённого CDN OpenAI')
+    if limit <= 0:
+        raise ImportFailure('Достигнут лимит данных импорта')
+    request = Request(value, headers={
+        'User-Agent': 'Mozilla/5.0', 'Referer': 'https://chatgpt.com/',
+        'Origin': 'https://chatgpt.com', 'Accept': 'image/*',
+    })
+    with opener.open(request, timeout=15) as response:
+        extension = WIDGET_IMAGE_EXTENSIONS.get(response.headers.get_content_type())
+        if not extension:
+            raise ImportFailure('CDN не вернул изображение поддерживаемого формата')
+        data = response.read(limit + 1)
+    if not data or len(data) > limit:
+        raise ImportFailure('Иллюстрация пуста или превышает лимит')
+    return data, extension
+
+
+def collect_widget_images(conversations, export, assets, diagnostics, upload_limit):
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    for cid, row in conversations.items():
+        resolved = {}
+        for node, item in row['mapping'].items():
+            message = item.get('message') if isinstance(item, dict) else None
+            if not isinstance(message, dict) or (message.get('author') or {}).get('role') != 'assistant':
+                continue
+            metadata = message.get('metadata') or {}
+            if metadata.get('is_visually_hidden_from_conversation') or message.get('channel') == 'analysis':
+                continue
+            model = metadata.get('model_dil_v2')
+            if not isinstance(model, dict) or not isinstance(model.get('code'), str):
+                continue
+            content = message.get('content') or {}
+            if not isinstance(content, dict) or message.get('recipient') not in {None, '', 'all'}:
+                continue
+            text = '\n'.join(part for part in (content.get('parts') or []) if isinstance(part, str))
+            if not text and isinstance(content.get('text'), str):
+                text = content['text']
+            requested = count_image_widgets(text)
+            if not requested:
+                continue
+            app = model.get('appData')
+            op = app.get('opGenui') if isinstance(app, dict) else None
+            results = op.get('componentResults') if isinstance(op, dict) else None
+            constants = model.get('constants') or {}
+            if not isinstance(results, dict) or not isinstance(constants, dict):
+                continue
+            for ordinal, (component, props, key) in enumerate(WIDGET_INVOCATION.findall(model['code']), 1):
+                literal = WIDGET_QUERY_LITERAL.search(props)
+                result = results.get(constants.get(key)) if isinstance(constants.get(key), str) else None
+                if (not literal or not isinstance(result, dict) or result.get('componentName') != component
+                        or result.get('status') != 'resolved'):
+                    continue
+                try:
+                    query = json.loads(literal[1])
+                except ValueError:
+                    continue
+                state = result.get('state')
+                images = state.get('images') if isinstance(state, dict) else None
+                if not isinstance(images, list) or not requested.get(widget_key(component, query)):
+                    continue
+                paths = []
+                for number, image in enumerate(images[:1] if component == 'AsyncImage' else images, 1):
+                    if not isinstance(image, dict):
+                        continue
+                    url = image.get('content_url') or image.get('thumbnail_url')
+                    if not isinstance(url, str):
+                        continue
+                    try:
+                        data, extension = download_widget_image(opener, url, min(export.image_budget, upload_limit, 16 * MIB))
+                        path = PurePosixPath('files', 'widget-' + digest([cid, node])[:24], f'image-{ordinal}-{number}{extension}')
+                        if path in assets:
+                            raise ImportFailure('Конфликт имени файла иллюстрации в выгрузке')
+                    except (ImportFailure, HTTPError, URLError, OSError, ValueError, TransportError) as error:
+                        reason = (f'HTTP {error.code}' if isinstance(error, HTTPError) else str(error)
+                                  if isinstance(error, ImportFailure) else 'Сетевой сбой при обращении к CDN OpenAI')
+                        diagnostics.append({'stage': 'Скачивание иллюстрации ответа', 'chat': cid, 'message': node,
+                                            'file': f'{ordinal}.{number}', 'reason': reason})
+                        continue
+                    export.additional_files[path] = data
+                    export.image_budget -= len(data)
+                    assets[path] = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data), 'dimensions': None}
+                    paths.append(path.as_posix())
+                resolved.setdefault(node, []).append({'component': component, 'query': query, 'paths': paths})
+        if any(record['paths'] for records in resolved.values() for record in records):
+            row['chatgpt_import_images'] = resolved
+
+
+def bind_widget_images(text, records, assets, conversation, node, diagnostics):
+    matches = count_image_widgets(text)
+    if not matches:
+        return {}
     candidates = defaultdict(list)
     for record in records if isinstance(records, list) else []:
         if not isinstance(record, dict) or not isinstance(record.get('component'), str):

@@ -20,7 +20,7 @@ import zipfile
 
 from import_chatgpt import (
     API, MIB, Export, ImportFailure, RequestFailure, UnconfirmedWrite, WebUI,
-    apply_import, convert, markdown_link, remote_id,
+    apply_import, collect_widget_images, convert, markdown_link, remote_id,
 )
 
 
@@ -81,7 +81,7 @@ let reportId;
 let reportPending = false;
 const importEvents = [];
 const journalFiles = new Map();
-const totals = { counts: {}, warnings: {}, unlinked: 0, unavailable: new Set() };
+const totals = { counts: {}, warnings: {}, unlinked: 0, widgetImages: 0, unavailable: new Set() };
 const warningLabels = {
   project_without_id: 'Проект без ID',
   unresolved_project_membership: 'Чат проекта не найден',
@@ -192,6 +192,7 @@ async function saveJournal(state, total) {
     lines.push(`Чатов добавлено: ${totals.counts.conversation_written || 0}`,
       `Файлов добавлено: ${totals.counts.attachment_written || 0}`,
       `Записей памяти добавлено: ${totals.counts.memory_written || 0}`);
+    if (totals.widgetImages) lines.push(`Иллюстраций скачано с CDN OpenAI: ${totals.widgetImages}`);
   }
   if (totals.unavailable.size) lines.push(`ChatGPT не вернул: ${[...totals.unavailable].join(', ')}`);
   for (const event of [...(exportReport?.events || []), ...importEvents]) {
@@ -260,6 +261,7 @@ form.addEventListener('submit', async (event) => {
         totals.warnings[name] = (totals.warnings[name] || 0) + count;
       }
       totals.unlinked += data.files_unlinked;
+      totals.widgetImages += data.widget_images || 0;
       for (const section of data.personalization_unavailable) totals.unavailable.add(section);
       archives.shift();
       completed++;
@@ -281,6 +283,7 @@ form.addEventListener('submit', async (event) => {
       + `Записей памяти добавлено: ${counts.memory_written || 0}. Уже в памяти: ${counts.memory_unchanged || 0}. `
       + `Новых файлов: ${counts.attachment_written || 0}. Повторно использовано файлов: ${counts.attachment_unchanged || 0}. `
       + `Файлов без связи с сообщениями: ${totals.unlinked}.`;
+    if (totals.widgetImages) status.textContent += ` Иллюстраций скачано с CDN OpenAI: ${totals.widgetImages}.`;
     const warnings = describeCounts(totals.warnings, warningLabels);
     if (warnings) status.textContent += ` Предупреждения: ${warnings}.`;
     if (totals.unavailable.size) {
@@ -473,6 +476,7 @@ class BrowserImport(BaseHTTPRequestHandler):
                 conversations, project_rows, assets = export.inventory()
                 if not conversations and not project_rows:
                     raise UploadError(400, 'В ZIP не найдено бесед или проектов ChatGPT.')
+                collect_widget_images(conversations, export, assets, self.diagnostics, settings.upload_limit_mib * MIB)
                 chats, projects = convert(conversations, project_rows, assets, warnings, self.diagnostics)
                 return {
                     **apply_import(
@@ -481,6 +485,7 @@ class BrowserImport(BaseHTTPRequestHandler):
                         journal_path=settings.data_dir / f"{user['id']}.sqlite3", diagnostics=self.diagnostics,
                     ),
                     'warnings': dict(warnings),
+                    'widget_images': len(export.additional_files),
                     'personalization_unavailable': export.personalization_unavailable,
                 }
 
