@@ -1,7 +1,9 @@
 """Read ChatGPT ZIP data and import it through the Open WebUI API. Python 3.10+."""
 
+from ast import literal_eval
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import hashlib
 from html import unescape
 from http.client import HTTPException as TransportError
@@ -44,16 +46,17 @@ CHATGPT_CODE_BLOCK = (
     r'(?P<block_body>[\s\S]*?)</CodeBlock\s*>)'
 )
 PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.M)
-DIL_TAGS = r'form|label|radio-group|radio|slider|button|grid-item|grid|caption|icon|checkbox|chart|table-row|table-cell|table|box'
-DIL_MARKUP = re.compile(r'\{@body\b|\{#each\b|</?(?:form|grid(?:-item)?|chart|slider|table|button|checkbox|radio-group|caption)(?=[\s/>])', re.I)
+DIL_BLOCKS = {'form', 'grid', 'grid-item', 'chart', 'slider', 'table', 'radio-group', 'checkbox'}
+DIL_INLINE = {'label', 'radio', 'button', 'caption', 'icon'}
+DIL_VOID = {'br', 'hr', 'img', 'input', 'link', 'meta', 'source', 'wbr'}
 DIL_TOKEN = re.compile(
-    PROTECTED_CODE.pattern + r'|(?P<dil_tag><(?P<dil_close>/)?(?P<dil_name>(?i:' + DIL_TAGS
-    + r'))(?=[\s/>]))|(?P<dil_expression>\{(?=@body\b|#each\b|/each\b|[a-zA-Z_]))', re.M,
+    PROTECTED_CODE.pattern + r'|(?P<dil_tag>\\?<(?P<dil_close>/)?(?P<dil_name>[A-Za-z][\w-]*)(?=[\s/>]))'
+    r'|(?P<dil_expression>\{(?=@body\b|#each\b|/each\b|[a-zA-Z_]))', re.M,
 )
 DIL_DELIMITER = re.compile(r'''(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\x60(?:\\[\s\S]|[^\x60\\])*\x60)|[{}>]''')
-DIL_JSON_KEYS = re.compile(r'"(?:\\.|[^"\\])*"|(?P<key>[A-Za-z_]\w*)(?=\s*:)')
+DIL_JSON_KEYS = re.compile(r'''"(?:\\.|[^"\\])*"|(?P<quoted>'(?:\\.|[^'\\])*')|(?P<key>[A-Za-z_]\w*)(?=\s*:)''')
 DIL_PATH = r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*'
-DIL_STATE = re.compile(r'const\s+(?:\[\s*([A-Za-z_]\w*)\s*,\s*[A-Za-z_]\w*\s*\]\s*=\s*DIL\.useState\((.*)\)|([A-Za-z_]\w*)\s*=\s*(.*))\s*;?', re.S)
+DIL_STATE = re.compile(r'(?:const|let)\s+(?:\[\s*([A-Za-z_]\w*)\s*,\s*[A-Za-z_]\w*\s*\]\s*=\s*DIL\.useState\((.*)\)|([A-Za-z_]\w*)\s*=\s*(.*))\s*;?', re.S)
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
 WIDGET_QUERY = re.compile(r'''\bquery\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])\s*\})''')
 WIDGET_TAGS = {'asyncimage', 'asyncimagegroup'}
@@ -594,16 +597,20 @@ def dil_end(text, start, expression):
 
 
 def dil_json(literal):
+    def json_token(match):
+        if match['key']:
+            return json.dumps(match['key'])
+        if match['quoted']:
+            return json.dumps(literal_eval(match['quoted']))
+        return match.group()
+
     try:
-        return json.loads(DIL_JSON_KEYS.sub(lambda match: json.dumps(match['key'])
-                                           if match['key'] else match.group(), literal))
-    except (ValueError, RecursionError):
+        return json.loads(DIL_JSON_KEYS.sub(json_token, literal))
+    except (ValueError, SyntaxError, RecursionError):
         return None
 
 
-def dil_value(expression, scope):
-    conditional = re.fullmatch(rf'({DIL_PATH})\s*\?\s*("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")', expression)
-    path = conditional[1] if conditional else expression
+def dil_lookup(path, scope):
     if not re.fullmatch(DIL_PATH, path):
         return None
     root, *fields = path.split('.')
@@ -615,6 +622,15 @@ def dil_value(expression, scope):
             value = len(value)
         else:
             return None
+    return value
+
+
+def dil_value(expression, scope):
+    conditional = re.fullmatch(
+        rf'''({DIL_PATH})\s*\?\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''',
+        expression,
+    )
+    value = dil_lookup(conditional[1] if conditional else expression, scope)
     if conditional and value is not None:
         return dil_json(conditional[2] if value else conditional[3])
     return value if isinstance(value, (str, int, float)) else None
@@ -647,102 +663,153 @@ def dil_chart(attrs):
     return f'\n\n{summary}' + dil_table(headers, rows)
 
 
-def dil_loop_end(text, start):
-    depth, position = 1, start
-    while match := DIL_TOKEN.search(text, position):
-        position = match.end()
-        if match['dil_tag'] or match['dil_expression']:
-            end = dil_end(text, position, bool(match['dil_expression']))
-            if not end:
-                continue
-            position = end
-            if match['dil_expression']:
-                expression = text[match.end():end - 1]
-                if expression.startswith('#each'):
-                    depth += 1
-                elif expression.startswith('/each'):
-                    depth -= 1
-                    if not depth:
-                        return match.start(), end
-    return None
+@dataclass
+class DilNode:
+    name: str
+    value: str = ''
+    opening: str = ''
+    closing: str = ''
+    children: list = field(default_factory=list)
 
 
-def render_dil_markup(text, scope=None, depth=0, budget=None):
-    if not DIL_MARKUP.search(text) and scope is None:
-        return text
-    scope = {} if scope is None else scope.copy()
-    budget = [1000] if budget is None else budget
-    result = []
+def parse_dil_markup(text):
+    root = DilNode('root')
+    stack = [root]
     position = 0
+    structured = False
     while match := DIL_TOKEN.search(text, position):
-        before = text[position:match.start()]
+        stack[-1].children.append(text[position:match.start()])
         position = match.end()
         expression = bool(match['dil_expression'])
         if not (expression or match['dil_tag']):
-            result.extend((before, match.group()))
+            stack[-1].children.append(match.group())
             continue
         end = dil_end(text, position, expression)
         if end is None:
-            result.extend((before, match.group()))
+            stack[-1].children.append(match.group())
             continue
         value = text[position:end - 1].strip()
+        raw = text[match.start():end]
         position = end
-        if expression and value.startswith('@body'):
-            result.append(re.sub(r'(?m)^[ \t]*#{1,6}[ \t]*$', '', before))
-            declaration = DIL_STATE.fullmatch(value[5:].strip().rstrip(';'))
+        if expression:
+            directive = value.split(maxsplit=1)[0] if value else ''
+            name = directive if directive in {'@body', '#each', '/each'} else 'expression'
+            closing = name == '/each'
+            if closing:
+                name = '#each'
+            structured |= name in {'@body', '#each'}
+            opens_block = name == '#each'
+        else:
+            name = match['dil_name'].casefold()
+            closing = bool(match['dil_close'])
+            structured |= name in DIL_BLOCKS or name in DIL_INLINE
+            opens_block = name not in DIL_VOID and not value.endswith('/')
+        if closing:
+            container = next((i for i in range(len(stack) - 1, 0, -1) if stack[i].name == name), None)
+            if container is None:
+                stack[-1].children.append(raw)
+            else:
+                stack[container].closing = raw
+                del stack[container:]
+        else:
+            node = DilNode(name, value, raw)
+            stack[-1].children.append(node)
+            if opens_block and len(stack) < 64:
+                stack.append(node)
+    stack[-1].children.append(text[position:])
+    return root if structured else None
+
+
+def render_dil_nodes(nodes, scope, budget, inside=False):
+    output = []
+
+    def children(node, *, widget=inside, values=scope):
+        return render_dil_nodes(node.children, values, budget, widget)
+
+    for node in nodes:
+        if isinstance(node, str):
+            output.append(node)
+        elif node.name == '@body':
+            if output:
+                output[-1] = re.sub(r'(?m)^[ \t]*#{1,6}[ \t]*$', '', output[-1])
+            declaration = DIL_STATE.fullmatch(node.value[5:].strip().rstrip(';'))
             if declaration:
                 name = declaration[1] or declaration[3]
                 scope[name] = dil_json(declaration[2] if declaration[1] else declaration[4])
-            continue
-        result.append(before)
-        if expression:
-            if value.startswith('#each'):
-                loop = dil_loop_end(text, end)
-                if loop:
-                    body_end, position = loop
-                    clause = re.fullmatch(r'#each\s+(.+)\s+as\s+([A-Za-z_]\w*)', value, re.S)
-                    if clause and depth < 4:
-                        literal, name = clause.groups()
-                        items = scope.get(literal.strip()) if re.fullmatch(DIL_PATH, literal.strip()) else dil_json(literal)
-                        if isinstance(items, list):
-                            for item in items[:100]:
-                                if not budget[0]:
-                                    break
-                                budget[0] -= 1
-                                result.append(render_dil_markup(text[end:body_end], {**scope, name: item}, depth + 1, budget))
+        elif node.name == 'expression':
+            value = dil_value(node.value, scope)
+            output.append(str(value) if value is not None else node.opening)
+        elif node.name == '#each':
+            clause = re.fullmatch(r'#each\s+(.+?)\s+as\s+([A-Za-z_]\w*)', node.value, re.S)
+            if clause is None:
+                output.append(children(node, widget=True))
+                continue
+            literal, name = clause.groups()
+            items = dil_lookup(literal, scope) if re.fullmatch(DIL_PATH, literal) else dil_json(literal)
+            if isinstance(items, list):
+                for item in items:
+                    if budget[0] <= 0:
+                        break
+                    budget[0] -= 1
+                    output.append(children(node, widget=True, values={**scope, name: item}))
+            else:
+                output.append(children(node, widget=True))
+        elif node.name == 'chart':
+            output.append(dil_chart(node.value))
+        elif node.name == 'table':
+            rows = []
+            headers = None
+            for row in node.children:
+                if not isinstance(row, DilNode) or row.name not in {'table-row', 'tr'}:
                     continue
-            rendered = dil_value(value, scope)
-            result.append(str(rendered) if rendered is not None else text[match.start():end])
-            continue
-
-        tag = match['dil_name'].casefold()
-        closing = bool(match['dil_close'])
-        if tag == 'chart' and not closing:
-            result.append(dil_chart(value))
-        elif tag == 'table' and not closing:
-            table_end = re.search(r'</table\s*>', text[end:], re.I)
-            if table_end:
-                table = text[end:end + table_end.start()]
-                position = end + table_end.end()
-                rows = [[render_dil_markup(cell, scope, depth) for cell in re.findall(
-                    r'<table-cell\b[^>]*>(.*?)</table-cell\s*>', row, re.I | re.S)]
-                    for row in re.findall(r'<table-row\b[^>]*>(.*?)</table-row\s*>', table, re.I | re.S)]
-                width = max(map(len, rows), default=0)
-                if width:
-                    result.append(dil_table([f'Столбец {index}' for index in range(1, width + 1)],
-                                            [row + [''] * (width - len(row)) for row in rows]))
-        elif tag == 'label':
-            result.append('**\n\n' if closing else '\n\n**')
-        elif tag in {'checkbox', 'radio'}:
-            result.append('\n' if closing else '\n- [ ] ' if tag == 'checkbox' else '\n- ')
-        elif tag == 'slider' and not closing:
-            bounds = dict(re.findall(r'\b(min|max|step)\s*=\s*\{\s*(-?\d+(?:\.\d+)?)\s*\}', value))
+                cells = [cell for cell in row.children if isinstance(cell, DilNode)
+                         and cell.name in {'table-cell', 'td', 'th'}]
+                if not cells:
+                    continue
+                values = [children(cell, widget=True) for cell in cells]
+                if headers is None and all(cell.name == 'th' for cell in cells):
+                    headers = values
+                else:
+                    rows.append(values)
+            width = max([len(headers or []), *(len(row) for row in rows)])
+            if width:
+                headers = headers or [f'Столбец {index}' for index in range(1, width + 1)]
+                output.append(dil_table(headers + [''] * (width - len(headers)),
+                                        [row + [''] * (width - len(row)) for row in rows]))
+            else:
+                output.append(children(node, widget=True))
+        elif node.name == 'label':
+            body = children(node, widget=True).strip()
+            if body:
+                output.append(f'\n\n**{body}**\n\n')
+        elif node.name in {'radio', 'checkbox'}:
+            body = children(node, widget=True).strip()
+            if body:
+                mark = '[ ] ' if node.name == 'checkbox' else ''
+                output.append(f'\n- {mark}{body}\n')
+        elif node.name == 'slider':
+            bounds = dict(re.findall(r'\b(min|max|step)\s*=\s*\{\s*(-?\d+(?:\.\d+)?)\s*\}', node.value))
             if 'min' in bounds and 'max' in bounds:
                 step = f", шаг {bounds['step']}" if 'step' in bounds else ''
-                result.append(f"\n\nДиапазон {bounds['min']}–{bounds['max']}{step}.\n\n")
-        elif tag not in {'icon', 'box'}:
-            result.append('\n\n')
-    return ''.join(result) + text[position:]
+                output.append(f"\n\nДиапазон {bounds['min']}–{bounds['max']}{step}.\n\n")
+        elif node.name in DIL_BLOCKS or node.name in {'caption', 'button'}:
+            output.append('\n\n' + children(node, widget=True).strip() + '\n\n')
+        elif node.name == 'icon':
+            continue
+        elif node.name == 'box' and inside:
+            output.append(children(node))
+        elif CHATGPT_TAG.fullmatch(node.opening.lstrip('\\')):
+            output.extend((node.opening.lstrip('\\'), children(node), node.closing.lstrip('\\')))
+        elif inside:
+            output.append(children(node))
+        else:
+            output.extend((node.opening, children(node), node.closing))
+    return ''.join(output)
+
+
+def render_dil_markup(text):
+    tree = parse_dil_markup(text)
+    return render_dil_nodes(tree.children, {}, [1000]) if tree else text
 
 
 def render_chatgpt_markdown(text, source, chat, files):
