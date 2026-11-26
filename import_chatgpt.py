@@ -47,6 +47,7 @@ PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.
 ATTR = re.compile(r'''\b([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
 WIDGET_QUERY = re.compile(r'''\bquery\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*("(?:\\.|[^"\\])*"|\[(?:[^"\]]|"(?:\\.|[^"\\])*")*\])\s*\})''')
 WIDGET_TAGS = {'asyncimage', 'asyncimagegroup'}
+PDF_PAGE_PREVIEW = re.compile(r'[a-f0-9]+#(?P<document>file[_-][a-z0-9]+)#p_\d+\.[a-f0-9]+\.(?:jpg|jpeg|png)', re.I)
 WIDGET_INVOCATION = re.compile(
     r'__dil\.jsx\((AsyncImage(?:Group)?),\{((?:[^{}"]|"(?:\\.|[^"\\])*")*?)'
     r'"__resolutionId"\s*:\s*__dilConstants\["([^"\\]+)"\]',
@@ -652,6 +653,7 @@ def visible_message(message, assets, conversation):
             or content.get('content_type') in {'thoughts', 'reasoning_recap', 'model_editable_context'}):
         return None
     parts, attachments, links, attachment_ids = [], {}, {}, {}
+    pdf_ids = set()
     attachment_expected = False
     for item in metadata.get('attachments') or []:
         if isinstance(item, dict):
@@ -660,6 +662,8 @@ def visible_message(message, assets, conversation):
             path = assets.resolve(ids, item.get('name'), conversation)
             if path:
                 attachments[path] = str(item.get('name') or path.name)
+                if path.suffix.casefold() == '.pdf' and isinstance(item.get('id'), str):
+                    pdf_ids.add(source_name(item['id']))
                 for ident in ids:
                     if ident:
                         attachment_ids[source_name(ident)] = path
@@ -693,6 +697,7 @@ def visible_message(message, assets, conversation):
     return {
         'role': role, 'content': text, 'timestamp': unix_time(message.get('create_time')),
         'model': metadata.get('model_slug'), 'attachments': attachments, 'links': links,
+        'pdf_ids': pdf_ids,
         'content_references': [ref for ref in metadata.get('content_references') or [] if isinstance(ref, dict)],
     }
 
@@ -730,6 +735,29 @@ def generated_image_message(message, assets, conversation):
         'timestamp': unix_time(message.get('create_time')), 'model': metadata.get('model_slug'),
         'attachments': attachments, 'links': {}, 'content_references': [],
     }
+
+
+def pdf_page_previews(source_messages, pdf_ids, index, conversation):
+    previews = set()
+    if not pdf_ids:
+        return previews
+    for message in source_messages:
+        author = message.get('author') or {}
+        content = message.get('content') or {}
+        if (author.get('role') != 'tool' or author.get('name') != 'api_tool'
+                or content.get('content_type') != 'multimodal_text'):
+            continue
+        parts = content.get('parts') or []
+        if not any(isinstance(part, str) and '<IMAGE FOR PAGE:' in part for part in parts):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get('content_type') != 'image_asset_pointer':
+                continue
+            pointer = source_name(part.get('asset_pointer'))
+            match = PDF_PAGE_PREVIEW.fullmatch(pointer)
+            if match and match['document'] in pdf_ids:
+                previews.update(index.in_conversation(index.aliases.get(pointer, ()), conversation))
+    return previews
 
 
 def convert(conversations, projects, assets, warnings, diagnostics):
@@ -803,6 +831,7 @@ def convert(conversations, projects, assets, warnings, diagnostics):
         attached_paths.update(path for message in visible.values() for images in message.get('widget_images', {}).values()
                               for paths in images for path in paths)
         source_messages = [node['message'] for node in mapping.values() if isinstance(node.get('message'), dict)]
+        pdf_ids = {ident for message in visible.values() for ident in message.get('pdf_ids', ())}
         signature = digest([row, project, {str(p): assets[p]['sha256'] for p in attached_paths}])
         output.append({
             'id': cid, 'fingerprint': signature, 'project': project, 'active': active,
@@ -811,6 +840,7 @@ def convert(conversations, projects, assets, warnings, diagnostics):
             'archived': row.get('is_archived') is True,
             'pinned': row.get('is_starred') is True or bool(row.get('pinned_time')),
             'model': row.get('default_model_slug'), 'assets': attached_paths,
+            'pdf_previews': pdf_page_previews(source_messages, pdf_ids, index, cid),
             'web_references': web_index(source_messages),
             'document_references': document_index(source_messages, attached_paths),
         })
@@ -1189,9 +1219,10 @@ def server_preflight(api, user, upload_limit, upload_sizes, need_folders):
 
 def apply_import(api, user, export, chats, projects, assets, *, upload_limit, journal_path, diagnostics):
     associated = {path for chat in chats for path in chat['assets']}
-    unlinked = assets.keys() - associated
+    previews = {path for chat in chats for path in chat['pdf_previews']}
+    unlinked = assets.keys() - associated - previews
     limit = server_preflight(api, user, upload_limit, (assets[path]['size'] for path in associated), bool(projects))
-    attachment_sizes = {item['sha256']: item['size'] for item in assets.values()}
+    attachment_sizes = {assets[path]['sha256']: assets[path]['size'] for path in associated | unlinked}
 
     with journal(journal_path) as database:
         migration = Migration(api, user['id'], database, attachment_sizes)
