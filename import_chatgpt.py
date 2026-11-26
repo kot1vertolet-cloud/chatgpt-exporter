@@ -46,6 +46,7 @@ CHATGPT_CODE_BLOCK = (
 PROTECTED_CODE = re.compile(f'{MARKDOWN_CODE.pattern}|{CHATGPT_CODE_BLOCK}', re.M)
 DIL_TAGS = r'form|label|radio-group|radio|slider|button|grid-item|grid|caption|icon|checkbox|chart|table-row|table-cell|table|box'
 DIL_MARKUP = re.compile(r'\{@body\b|\{#each\b|</?(?:form|grid(?:-item)?|chart|slider|table|button|checkbox|radio-group|caption)(?=[\s/>])', re.I)
+DIL_PLACEHOLDER = '\ue200genui\ue202'
 DIL_TOKEN = re.compile(
     PROTECTED_CODE.pattern + r'|(?P<dil_tag><(?P<dil_close>/)?(?P<dil_name>(?i:' + DIL_TAGS
     + r'))(?=[\s/>]))|(?P<dil_expression>\{(?=@body\b|#each\b|/each\b|[a-zA-Z_]))', re.M,
@@ -745,6 +746,24 @@ def render_dil_markup(text, scope=None, depth=0, budget=None):
     return ''.join(result) + text[position:]
 
 
+def chatgpt_fallback_markdown(text, metadata):
+    model = metadata.get('model_dil_v2')
+    if not isinstance(model, dict) or model.get('fallbackMarkdownVersion') != 1:
+        return text
+    fallback = model.get('fallbackMarkdown')
+    if not isinstance(fallback, str) or not fallback.strip():
+        return text
+    if not text.strip():
+        return fallback
+    # Keep saved image widgets available to the image resolver.
+    if 'asyncimage' in text.casefold():
+        return text
+    if ((DIL_MARKUP.search(text) or DIL_PLACEHOLDER in text)
+            and not DIL_MARKUP.search(fallback) and DIL_PLACEHOLDER not in fallback):
+        return fallback
+    return text
+
+
 def render_chatgpt_markdown(text, source, chat, files):
     text = render_dil_markup(text)
     web = chat['web_references']
@@ -867,6 +886,8 @@ def visible_message(message, assets, conversation):
     if not parts and isinstance(content.get('text'), str):
         parts.append(content['text'])
     text = '\n'.join(parts)
+    if role == 'assistant':
+        text = chatgpt_fallback_markdown(text, metadata)
     for match in LOCAL_LINK.finditer(text):
         reference = match.group(1)
         path = assets.resolve((), reference, conversation)
